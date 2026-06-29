@@ -78,7 +78,7 @@ interface DForm { avgPts: number; dnfRate: number; races: number }
 async function getForm(season: number): Promise<Record<string, DForm>> {
   const s: Record<string,{total:number,races:number,dnfs:number}> = {};
   try {
-    const r = await fetchT(`https://api.jolpi.ca/ergast/f1/${season}/results.json?limit=200`,
+    const r = await fetchT(`https://api.jolpi.ca/ergast/f1/${season}/results.json?limit=100&offset=0`,
       { next: { revalidate: 3600 } }, 8000);
     if (!r.ok) return {};
     const data = (await r.json())?.MRData;
@@ -107,25 +107,30 @@ interface THistory { avgPts: number; dnfRate: number }
 async function getTrackHistory(circuitId: string): Promise<{stats:Record<string,THistory>,avgDnfRate:number}> {
   const s: Record<string,{total:number,races:number,dnfs:number}> = {};
   let td=0, te=0;
-  for (const year of [2023,2024,2025]) {
+
+  // Fetch all 3 seasons IN PARALLEL (was sequential — up to 18s, now ~6s max)
+  const results = await Promise.all([2023,2024,2025].map(async year => {
     try {
       const r = await fetchT(
         `https://api.jolpi.ca/ergast/f1/${year}/circuits/${circuitId}/results.json?limit=50`,
-        { next: { revalidate: 86400 } }, 6000);
-      if (!r.ok) continue;
-      const race = (await r.json())?.MRData?.RaceTable?.Races?.[0];
-      if (!race) continue;
-      for (const res of race.Results??[]) {
-        const code = res.Driver?.code;
-        if (!code) continue;
-        const pos = (res.status==="Finished"||res.status?.startsWith("+")) ? parseInt(res.position) : null;
-        const fp = calcFP(pos, parseInt(res.grid)||1, res.FastestLap?.rank==="1");
-        if (!s[code]) s[code]={total:0,races:0,dnfs:0};
-        s[code].total+=fp; s[code].races++;
-        if (pos===null){s[code].dnfs++;td++;}
-        te++;
-      }
-    } catch {}
+        { next: { revalidate: 86400 } }, 5000);
+      if (!r.ok) return null;
+      return (await r.json())?.MRData?.RaceTable?.Races?.[0] ?? null;
+    } catch { return null; }
+  }));
+
+  for (const race of results) {
+    if (!race) continue;
+    for (const res of race.Results??[]) {
+      const code = res.Driver?.code;
+      if (!code) continue;
+      const pos = (res.status==="Finished"||res.status?.startsWith("+")) ? parseInt(res.position) : null;
+      const fp = calcFP(pos, parseInt(res.grid)||1, res.FastestLap?.rank==="1");
+      if (!s[code]) s[code]={total:0,races:0,dnfs:0};
+      s[code].total+=fp; s[code].races++;
+      if (pos===null){s[code].dnfs++;td++;}
+      te++;
+    }
   }
   return {
     stats: Object.fromEntries(Object.entries(s).map(([c,v])=>[c,{
@@ -199,73 +204,43 @@ async function getWeekendData(trackId: string, year: number): Promise<WeekendDat
     const qualiSimScores: Record<string,number> = {};
     const longRunScores:  Record<string,number> = {};
 
-    for (const sess of practiceCompleted) {
-      const [lapsRes, drRes] = await Promise.all([
-        fetchT(`https://api.openf1.org/v1/laps?session_key=${sess.session_key}`, { next:{revalidate:300} }, 6000),
-        fetchT(`https://api.openf1.org/v1/drivers?session_key=${sess.session_key}`, { next:{revalidate:300} }, 4000),
-      ]);
-      if (!lapsRes.ok || !drRes.ok) continue;
+    // Use /position endpoint for practice (much smaller than /laps which has thousands of rows)
+    // Process max 2 most recent practice sessions to stay within timeout
+    const recentPractice = practiceCompleted
+      .sort((a,b) => new Date(b.date_start).getTime() - new Date(a.date_start).getTime())
+      .slice(0, 2);
 
-      const laps: any[] = await lapsRes.json();
-      const drs: any[] = await drRes.json();
-      const num2code: Record<number,string> = {};
-      for (const d of drs) if (d.name_acronym) num2code[d.driver_number] = d.name_acronym;
+    for (const sess of recentPractice) {
+      try {
+        const [posRes, drRes] = await Promise.all([
+          fetchT(`https://api.openf1.org/v1/position?session_key=${sess.session_key}`, { next:{revalidate:300} }, 4000),
+          fetchT(`https://api.openf1.org/v1/drivers?session_key=${sess.session_key}`, { next:{revalidate:300} }, 3000),
+        ]);
+        if (!posRes.ok || !drRes.ok) continue;
 
-      // Group clean laps by driver
-      const driverLaps: Record<number, {dur: number, lapN: number}[]> = {};
-      for (const lap of laps) {
-        if (!lap.lap_duration || lap.lap_duration <= 0 || lap.is_pit_out_lap) continue;
-        if (!driverLaps[lap.driver_number]) driverLaps[lap.driver_number] = [];
-        driverLaps[lap.driver_number].push({ dur: lap.lap_duration, lapN: lap.lap_number });
-      }
+        const positions: any[] = await posRes.json();
+        const drs: any[] = await drRes.json();
 
-      // Quali-sim = fastest single lap (low fuel, fastest pace)
-      const fastestLaps: Record<number, number> = {};
-      for (const [num, ls] of Object.entries(driverLaps)) {
-        const sorted = ls.sort((a,b) => a.dur - b.dur);
-        if (sorted[0]) fastestLaps[parseInt(num)] = sorted[0].dur;
-      }
+        const num2code: Record<number,string> = {};
+        for (const d of drs) if (d.name_acronym) num2code[d.driver_number] = d.name_acronym;
 
-      // Long-run = average of best 3 consecutive laps excluding first/last
-      const longRunPace: Record<number, number> = {};
-      for (const [num, ls] of Object.entries(driverLaps)) {
-        const sorted = ls.sort((a,b) => a.lapN - b.lapN).slice(1,-1); // drop first/last
-        if (sorted.length < 3) continue;
-        let bestAvg = Infinity;
-        for (let i = 0; i <= sorted.length - 3; i++) {
-          const avg = (sorted[i].dur + sorted[i+1].dur + sorted[i+2].dur) / 3;
-          if (avg < bestAvg) bestAvg = avg;
+        // Final position per driver (last entry wins)
+        const finalPos: Record<number,number> = {};
+        for (const p of positions) if (p.position) finalPos[p.driver_number] = p.position;
+
+        const n = Object.keys(finalPos).length || 20;
+        for (const [num, pos] of Object.entries(finalPos)) {
+          const code = num2code[parseInt(num)];
+          if (!code) continue;
+          // Score: P1 = 1.0, P20 = 0.0
+          const score = parseFloat(((n - pos) / Math.max(n - 1, 1)).toFixed(3));
+          // Both quali-sim and long-run use the same position signal from practice
+          // (we can't distinguish without lap data, but position is still informative)
+          qualiSimScores[code] = qualiSimScores[code] !== undefined
+            ? (qualiSimScores[code] + score) / 2 : score;
+          longRunScores[code] = qualiSimScores[code]; // use same signal
         }
-        if (bestAvg < Infinity) longRunPace[parseInt(num)] = bestAvg;
-      }
-
-      // Normalise to 0-1 scores (1 = fastest in this session)
-      const normScore = (times: Record<number,number>) => {
-        const vals = Object.values(times).filter(t => t > 0).sort((a,b) => a-b);
-        if (!vals.length) return {} as Record<string,number>;
-        const fastest = vals[0], spread = vals[vals.length-1] - fastest;
-        return Object.fromEntries(
-          Object.entries(times).map(([num, t]) => [
-            num2code[parseInt(num)] ?? "",
-            spread > 0 ? parseFloat((1 - (t - fastest) / spread).toFixed(3)) : 1.0,
-          ]).filter(([c]) => c)
-        );
-      };
-
-      const qScores = normScore(fastestLaps);
-      const lScores = normScore(longRunPace);
-
-      // Accumulate (later sessions overwrite / average with earlier)
-      for (const [code, score] of Object.entries(qScores)) {
-        const s = score as number;
-        qualiSimScores[code] = qualiSimScores[code] !== undefined
-          ? (qualiSimScores[code] + s) / 2 : s;
-      }
-      for (const [code, score] of Object.entries(lScores)) {
-        const s = score as number;
-        longRunScores[code] = longRunScores[code] !== undefined
-          ? (longRunScores[code] + s) / 2 : s;
-      }
+      } catch { continue; }
     }
 
     const sessionsCompleted = practiceCompleted.length;
@@ -808,19 +783,18 @@ export async function POST(req: NextRequest) {
     const isFresh = mode==="fresh";
     const circuitId = CIRCUIT_IDS[track.id]??track.id;
 
-    // 1. Fetch all data in parallel, with a hard 12s cap on weekend data
-    //    so slow OpenF1 never kills the whole prediction
+    // 1. Fetch all data in parallel, with hard caps so slow APIs never block
+    const emptyForm: Record<string, DForm> = {};
+    const emptyTrack = { stats: {} as Record<string,THistory>, avgDnfRate: 0.08 };
     const weekendTimeout: WeekendData = {
       qualiSimScores:{}, longRunScores:{}, gridPositions:{},
       sessionsCompleted:0, sessionNames:[], noiseLevel:"high", available:false,
     };
+
     const [driverForm, {stats:trackStats, avgDnfRate}, weekend] = await Promise.all([
-      getForm(2026),
-      getTrackHistory(circuitId),
-      Promise.race([
-        getWeekendData(track.id, 2026),
-        new Promise<WeekendData>(res => setTimeout(() => res(weekendTimeout), 9000)),
-      ]),
+      Promise.race([getForm(2026),           new Promise<Record<string,DForm>>(r=>setTimeout(()=>r(emptyForm), 7000))]),
+      Promise.race([getTrackHistory(circuitId), new Promise<typeof emptyTrack>(r=>setTimeout(()=>r(emptyTrack), 7000))]),
+      Promise.race([getWeekendData(track.id, 2026), new Promise<WeekendData>(r=>setTimeout(()=>r(weekendTimeout), 7000))]),
     ]);
 
     // 2. Calculate EV for all assets using full spec formula
