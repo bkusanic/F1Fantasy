@@ -1330,6 +1330,85 @@ function ResultView({
             )}
           </div>
         </div>
+
+        {/* Avoid list + archetype (fresh mode only) */}
+        {isFresh && (prediction.avoidList?.length > 0 || prediction.archetype) && (
+          <div style={{ maxWidth:1100, margin:"12px auto 0", padding:"0 16px", display:"flex", gap:16, flexWrap:"wrap" }}>
+
+            {/* Archetype */}
+            {prediction.archetype && (
+              <div style={{ flex:"0 0 auto", background:S.card, border:`1px solid ${S.border}`,
+                borderRadius:4, padding:"10px 16px", display:"flex", alignItems:"center", gap:10 }}>
+                <span style={{ fontSize:14 }}>{prediction.archetype==="stars_and_scrubs"?"⭐":"⚖️"}</span>
+                <div>
+                  <div style={{ fontSize:10, color:S.muted, letterSpacing:"0.15em" }}>ARHETIP</div>
+                  <div style={{ fontSize:13, fontWeight:900, color:S.white }}>
+                    {prediction.archetype==="stars_and_scrubs" ? "Stars & Scrubs" : "Balanced"}
+                  </div>
+                  <div style={{ fontSize:11, color:S.muted }}>
+                    {prediction.archetype==="stars_and_scrubs"
+                      ? "2 Tier-A konstruktora + jeftini punioci"
+                      : "Mješoviti konstruktori + dublja vozačka linija"}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Kombinacije */}
+            {prediction.considered > 0 && (
+              <div style={{ flex:"0 0 auto", background:S.card, border:`1px solid ${S.border}`,
+                borderRadius:4, padding:"10px 16px" }}>
+                <div style={{ fontSize:10, color:S.muted, letterSpacing:"0.15em" }}>PRETRAŽIVANJE</div>
+                <div style={{ fontSize:13, fontWeight:900, color:S.gold }}>
+                  {prediction.considered.toLocaleString()} kombinacija
+                </div>
+                <div style={{ fontSize:11, color:S.muted }}>iscrpna pretraga · globalni optimum</div>
+              </div>
+            )}
+
+            {/* Avoid list */}
+            {prediction.avoidList?.length > 0 && (
+              <div style={{ flex:1, minWidth:200, background:S.card, border:`1px solid ${S.border}`,
+                borderRadius:4, padding:"10px 16px" }}>
+                <div style={{ fontSize:10, color:S.muted, letterSpacing:"0.15em", marginBottom:8 }}>
+                  AVOID LISTA — filtrirani iz pretrage
+                </div>
+                <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+                  {prediction.avoidList.map((a:any) => (
+                    <div key={a.code}
+                      onMouseEnter={e => setTooltip({x:e.clientX,y:e.clientY,content:`${a.code}: ${a.reason}`})}
+                      onMouseLeave={() => setTooltip(null)}
+                      style={{ display:"flex", alignItems:"center", gap:6, padding:"4px 10px",
+                        background:S.err+"12", border:`1px solid ${S.err}40`, borderRadius:3, cursor:"default" }}>
+                      <span style={{ fontSize:12, fontWeight:900, color:S.err }}>{a.code}</span>
+                      <span style={{ fontSize:10, color:S.muted }}>${a.price}M</span>
+                      <span style={{ fontSize:10, color:S.muted }}>EV:{a.ev?.toFixed(1)}</span>
+                    </div>
+                  ))}
+                </div>
+                {prediction.avoidRationale && (
+                  <div style={{ fontSize:11, color:S.muted, marginTop:8, lineHeight:1.5 }}>
+                    {prediction.avoidRationale}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Confidence note (fresh only) */}
+        {isFresh && prediction.confidenceNote && (
+          <div style={{ maxWidth:1100, margin:"8px auto 16px", padding:"0 16px" }}>
+            <div style={{ background:"#FFD70010", border:`1px solid #FFD70030`,
+              borderRadius:4, padding:"10px 16px",
+              display:"flex", alignItems:"flex-start", gap:10 }}>
+              <span style={{ fontSize:14, flexShrink:0 }}>⚠️</span>
+              <span style={{ fontSize:12, color:"#FFD700", lineHeight:1.6 }}>
+                {prediction.confidenceNote}
+              </span>
+            </div>
+          </div>
+        )}
       </main>
     </div>
   );

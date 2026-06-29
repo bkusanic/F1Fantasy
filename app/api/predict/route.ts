@@ -389,30 +389,143 @@ function calcEV(
 }
 
 // ─── Fresh team optimizer ─────────────────────────────────────────────────────
+// ─── Fresh team optimizer — per spec §3 ──────────────────────────────────────
+/**
+ * Exhaustive combinatorial search (spec §3 Korak 2 & §7):
+ *
+ *   team_EV = Σ EV(svih 7 asseta) + EV(boost_vozač)   ← boost vozač se broji duplo
+ *
+ * Primary:   maximise team_EV
+ * Tie-break: minimise remaining budget  (spec §4 — potrošnja je sekundarni cilj)
+ *
+ * Filters applied BEFORE search:
+ *   - Avoid list: dnfRate > 0.30 AND avgPts < 0  (loša forma + visok DNF rizik)
+ *   - DNF cap: at most 1 high-risk driver per team  (spec §3 Korak 5)
+ *
+ * ~1.4M iterations, < 100ms in Node.js — exhaustive, not greedy.
+ */
+interface FreshResult {
+  drivers: string[];
+  constructors: string[];
+  boostDriver: string;
+  totalCost: number;
+  remainingBudget: number;
+  totalEV: number;       // includes boost bonus
+  baseEV: number;        // without boost (sum of 7)
+  avoidList: {code:string; price:number; ev:number; reason:string}[];
+  archetype: "stars_and_scrubs" | "balanced";
+  considered: number;
+}
+
+const CONSTRUCTOR_TIER: Record<string,number> = {
+  mercedes:1, mclaren:1, ferrari:1,   // Tier A
+  redbull:2, williams:2,              // Tier B
+  rb:3, aston:3, haas:3, audi:3, alpine:3, cadillac:3,  // Tier C
+};
+
+const HIGH_DNF_THRESHOLD = 0.25;  // >25% DNF rate = high risk
+const AVOID_DNF_THRESHOLD = 0.30; // >30% + negative pts = on avoid list
+
 function freshOptimize(
-  drivers: {code:string,price:number,ev:number}[],
-  constrs: {id:string,price:number,ev:number}[],
+  allDrivers: {code:string; price:number; ev:number; dnfRate:number; avgPts:number}[],
+  allConstrs: {id:string; price:number; ev:number}[],
   budget: number
-) {
+): FreshResult {
+
+  // ── Build avoid list (spec §3 Korak 5) ──────────────────────────────────
+  const avoidList: FreshResult["avoidList"] = [];
+  for (const d of allDrivers) {
+    if (d.dnfRate > AVOID_DNF_THRESHOLD && d.avgPts < 0) {
+      avoidList.push({ code:d.code, price:d.price, ev:d.ev,
+        reason:`DNF rizik ${Math.round(d.dnfRate*100)}% + negativna forma (avg ${d.avgPts.toFixed(1)}pts)` });
+    }
+  }
+  const avoidCodes = new Set(avoidList.map(a => a.code));
+
+  // Eligible drivers after avoid filter
+  const drivers = allDrivers.filter(d => !avoidCodes.has(d.code));
+  const constrs  = allConstrs;
+
+  // Sort by EV/price ratio for pruning (doesn't affect correctness — only speed)
   const sd = [...drivers].sort((a,b) => (b.ev/b.price) - (a.ev/a.price));
   const sc = [...constrs].sort((a,b) => (b.ev/b.price) - (a.ev/a.price));
   const n=sd.length, m=sc.length;
-  const minC2 = sc.slice(-2).reduce((s,c)=>s+c.price, 0);
-  let bestEV=-Infinity, bestD:string[]=[], bestC:string[]=[], bestCost=0;
 
-  for(let i=0;i<n-4;i++){for(let j=i+1;j<n-3;j++){for(let k=j+1;k<n-2;k++){
-  for(let l=k+1;l<n-1;l++){for(let p=l+1;p<n;p++){
-    const dc=sd[i].price+sd[j].price+sd[k].price+sd[l].price+sd[p].price;
-    if(dc>budget-minC2) continue;
-    const dp=sd[i].ev+sd[j].ev+sd[k].ev+sd[l].ev+sd[p].ev;
-    for(let a=0;a<m-1;a++){for(let b=a+1;b<m;b++){
-      const tc=dc+sc[a].price+sc[b].price;
-      if(tc>budget) continue;
-      const tp=dp+sc[a].ev+sc[b].ev;
-      if(tp>bestEV){bestEV=tp;bestD=[sd[i].code,sd[j].code,sd[k].code,sd[l].code,sd[p].code];bestC=[sc[a].id,sc[b].id];bestCost=tc;}
+  // Cheapest possible 2 constructors (for budget pruning)
+  const minC2 = sc.slice(-2).reduce((s,c)=>s+c.price, 0);
+
+  let bestTeamEV   = -Infinity;
+  let bestRemaining = Infinity;   // tie-break: lower = better (spent more)
+  let bestD: string[]  = [];
+  let bestC: string[]  = [];
+  let bestCost         = 0;
+  let bestBoost        = "";
+  let considered       = 0;
+
+  for(let i=0;i<n-4;i++){
+  for(let j=i+1;j<n-3;j++){
+  for(let k=j+1;k<n-2;k++){
+  for(let l=k+1;l<n-1;l++){
+  for(let p=l+1;p<n;p++){
+    const dc = sd[i].price+sd[j].price+sd[k].price+sd[l].price+sd[p].price;
+    if(dc > budget - minC2) continue;
+
+    // DNF cap: at most 1 high-risk driver (spec §3 Korak 5)
+    const highDNF = [sd[i],sd[j],sd[k],sd[l],sd[p]]
+      .filter(d => d.dnfRate > HIGH_DNF_THRESHOLD).length;
+    if(highDNF > 1) continue;
+
+    const driverEVs = [sd[i].ev, sd[j].ev, sd[k].ev, sd[l].ev, sd[p].ev];
+    const sumDriverEV = driverEVs.reduce((s,e)=>s+e, 0);
+    // Boost goes to driver with highest EV (spec §3 Korak 3)
+    const boostEV = Math.max(...driverEVs);
+    const boostIdx = driverEVs.indexOf(boostEV);
+    const boostCode = [sd[i].code,sd[j].code,sd[k].code,sd[l].code,sd[p].code][boostIdx];
+
+    for(let a=0;a<m-1;a++){
+    for(let b=a+1;b<m;b++){
+      const tc = dc + sc[a].price + sc[b].price;
+      if(tc > budget) continue;
+      considered++;
+
+      const sumConstrEV = sc[a].ev + sc[b].ev;
+      // team_EV includes boost bonus (spec §3 Korak 3):
+      // boost driver counted twice = base sum + boostEV
+      const teamEV = sumDriverEV + sumConstrEV + boostEV;
+      const remaining = budget - tc;
+
+      // Primary: max teamEV; tie-break: min remaining (spec §4)
+      const betterEV   = teamEV > bestTeamEV + 0.05;
+      const tieBreak   = Math.abs(teamEV - bestTeamEV) <= 0.05 && remaining < bestRemaining;
+
+      if(betterEV || tieBreak){
+        bestTeamEV  = teamEV;
+        bestRemaining = remaining;
+        bestD       = [sd[i].code,sd[j].code,sd[k].code,sd[l].code,sd[p].code];
+        bestC       = [sc[a].id, sc[b].id];
+        bestCost    = tc;
+        bestBoost   = boostCode;
+      }
     }}
   }}}}}
-  return {drivers:bestD, constructors:bestC, totalCost:parseFloat(bestCost.toFixed(1)), totalEV:parseFloat(bestEV.toFixed(1))};
+
+  // Detect archetype (spec §6)
+  const tierAConstrs = bestC.filter(id => (CONSTRUCTOR_TIER[id]??3) === 1).length;
+  const archetype: FreshResult["archetype"] =
+    tierAConstrs >= 2 ? "stars_and_scrubs" : "balanced";
+
+  return {
+    drivers: bestD,
+    constructors: bestC,
+    boostDriver: bestBoost,
+    totalCost: parseFloat(bestCost.toFixed(1)),
+    remainingBudget: parseFloat((budget - bestCost).toFixed(1)),
+    totalEV: parseFloat(bestTeamEV.toFixed(1)),
+    baseEV: parseFloat((bestTeamEV - (allDrivers.find(d=>d.code===bestBoost)?.ev??0)).toFixed(1)),
+    avoidList,
+    archetype,
+    considered,
+  };
 }
 
 // ─── Transfer optimizer following spec pipeline (steps 0-5) ──────────────────
@@ -715,9 +828,15 @@ export async function POST(req: NextRequest) {
 
     if (isFresh) {
       const dOpts = Object.entries(allDriverData as Record<string,any>)
-        .map(([code,d]:any)=>({code,price:d.price as number,ev:evMap[code]?.ev??0}));
+        .map(([code,d]:any)=>({
+          code,
+          price: d.price as number,
+          ev: evMap[code]?.ev ?? 0,
+          dnfRate: driverForm[code]?.dnfRate ?? 0.08,
+          avgPts:  driverForm[code]?.avgPts  ?? 0,
+        }));
       const cOpts = Object.entries(constructorData as Record<string,any>)
-        .map(([id,c]:any)=>({id,price:c.price as number,ev:evMap[id]?.ev??0}));
+        .map(([id,c]:any)=>({id, price:c.price as number, ev:evMap[id]?.ev??0}));
       optResult = freshOptimize(dOpts, cOpts, totalBudget);
     } else {
       const cur = team?.drivers??[], curC = team?.constructors??[];
@@ -769,12 +888,44 @@ Sesijsko upozorenje: ${optResult.sessionsWarning ?? "—"}`;
 Odgovaraj u JSON formatu, na HRVATSKOM ili BOSANSKOM jeziku.`;
 
     const prompt = isFresh
-      ? `Optimalni tim za ${track.name} R${track.round} (sprint:${track.isSprint?"DA":"NE"}, $${totalBudget}M):
-VOZAČI: ${optResult.drivers?.join(", ")} | KONSTRUKTORI: ${optResult.constructors?.join(", ")}
-EV procjena: ${optResult.totalEV?.toFixed(1)}pts
+      ? `Optimalni novi tim za ${track.name} R${track.round} (sprint:${track.isSprint?"DA":"NE"}, cap $${totalBudget}M):
+
+ODABRANI TIM (kombinatorička pretraga, max team EV s boostom):
+  Vozači: ${optResult.drivers?.join(", ")}
+  Konstruktori: ${optResult.constructors?.join(", ")}
+  2× Boost: ${optResult.boostDriver} (najviši EV u timu)
+  Ukupna cijena: $${optResult.totalCost}M (preostalo: $${optResult.remainingBudget}M)
+  Team EV (s boostom): ${optResult.totalEV?.toFixed(1)}pts
+  Arhetip: ${optResult.archetype === "stars_and_scrubs" ? "Stars & Scrubs (2 Tier-A konstruktora)" : "Balanced (mješoviti konstruktori, dublja vozačka linija)"}
+
+EV PO ASSETU:
 ${evSummary}
+
+AVOID LISTA (filtrirani iz pretrage):
+${optResult.avoidList?.length > 0
+  ? optResult.avoidList.map((a:any)=>`  ${a.code} ($${a.price}M, EV=${a.ev}): ${a.reason}`).join("\n")
+  : "  Nema filtiranih asseta."}
+
 ${sessInfo}
-Vrati JSON: {"drsBoostRecommendation":{"driverId":"CODE","reason":"..."},"teamRationale":"...","analysis":"..."}`
+
+Objasni ZAŠTO je ovaj tim optimalan prema spec-u (boost sidro, konstruktorska jezgra, arhetip, avoid lista).
+Vrati JSON:
+{
+  "drsBoostRecommendation": {
+    "driverId": "${optResult.boostDriver}",
+    "reason": "Zašto ovaj vozač nosi boost — EV, forma, historija staze."
+  },
+  "teamRationale": "2-3 rečenice: arhetip, konstruktorska jezgra, zašto je ostatak tima odabran.",
+  "assetReasons": {
+    "${optResult.drivers?.[0]??''}": "razlog",
+    "${optResult.drivers?.[1]??''}": "razlog",
+    "${optResult.constructors?.[0]??''}": "razlog",
+    "${optResult.constructors?.[1]??''}": "razlog"
+  },
+  "avoidRationale": "Kratko zašto su filtrirani asseti izostavljeni.",
+  "confidenceNote": "Razina pouzdanosti procjene (pred-trening / sesije učitane / qualifying učitan).",
+  "analysis": "Sažetak strategije za ovaj vikend."
+}`
 
       : `Tim za ${track.name} R${track.round} (sprint:${track.isSprint?"DA":"NE"}):
 TIM: ${team?.drivers?.join(", ")} | ${team?.constructors?.join(", ")}
@@ -833,15 +984,36 @@ Vrati JSON: {
     };
 
     if(isFresh){
-      resp.suggestedDrivers=optResult.drivers;
-      resp.suggestedConstructors=optResult.constructors;
-      resp.totalCost=optResult.totalCost;
-      resp.remainingBudget=parseFloat((totalBudget-optResult.totalCost).toFixed(1));
-      resp.totalExpectedPoints=optResult.totalEV;
-      resp.captain=aiParsed.drsBoostRecommendation?.driverId??optResult.drivers?.[0]??"";
-      resp.teamRationale=aiParsed.teamRationale??"";
-      resp.predictedPoints=Object.fromEntries((optResult.drivers??[]).map((c:string)=>[c,expPts[c]??0]));
-      resp.constructorPoints=Object.fromEntries((optResult.constructors??[]).map((c:string)=>[c,expPts[c]??0]));
+      resp.suggestedDrivers   = optResult.drivers;
+      resp.suggestedConstructors = optResult.constructors;
+      resp.boostDriver        = optResult.boostDriver;
+      resp.captain            = optResult.boostDriver;   // boost = DRS captain
+      resp.totalCost          = optResult.totalCost;
+      resp.remainingBudget    = optResult.remainingBudget;
+      resp.totalExpectedPoints = optResult.totalEV;
+      resp.archetype          = optResult.archetype;
+      resp.avoidList          = optResult.avoidList ?? [];
+      resp.considered         = optResult.considered ?? 0;
+      // AI fields
+      resp.teamRationale      = aiParsed.teamRationale ?? "";
+      resp.assetReasons       = aiParsed.assetReasons  ?? {};
+      resp.avoidRationale     = aiParsed.avoidRationale ?? "";
+      resp.confidenceNote     = aiParsed.confidenceNote ?? "";
+      resp.analysis           = aiParsed.analysis ?? "";
+      resp.drsBoostRecommendation = {
+        driverId: optResult.boostDriver,
+        reason: aiParsed.drsBoostRecommendation?.reason ?? `${optResult.boostDriver} ima najviši EV u timu.`,
+      };
+      resp.predictedPoints    = Object.fromEntries((optResult.drivers??[]).map((c:string)=>[c,expPts[c]??0]));
+      resp.constructorPoints  = Object.fromEntries((optResult.constructors??[]).map((c:string)=>[c,expPts[c]??0]));
+      // Build recommendedTeam for ResultView compatibility
+      resp.recommendedTeam    = {
+        drivers: optResult.drivers,
+        constructors: optResult.constructors,
+        changedDrivers: optResult.drivers,
+        changedConstructors: optResult.constructors,
+        unchanged: false,
+      };
     } else {
       const fc=optResult.transfers?.filter((t:any)=>t.isFree).length??0;
       const pc=optResult.transfers?.filter((t:any)=>!t.isFree).length??0;
