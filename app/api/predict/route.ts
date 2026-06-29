@@ -489,11 +489,8 @@ function freshOptimize(
     const dc = sd[i].price+sd[j].price+sd[k].price+sd[l].price+sd[p].price;
     if(dc > budget - minC2) continue;
 
-    // DNF cap: at most 1 high-risk driver (spec §3 Korak 5)
-    const highDNF = [sd[i],sd[j],sd[k],sd[l],sd[p]]
-      .filter(d => d.dnfRate > HIGH_DNF_THRESHOLD).length;
-    if(highDNF > 1) continue;
-
+    // NOTE: DNF cap removed — DNF risk is already subtracted in EV formula
+    // Hard cap with 2026 data (60-100% DNF rates early season) kills all combos
     const driverEVs = [sd[i].ev, sd[j].ev, sd[k].ev, sd[l].ev, sd[p].ev];
     const sumDriverEV = driverEVs.reduce((s,e)=>s+e, 0);
     // Boost goes to driver with highest EV (spec §3 Korak 3)
@@ -537,29 +534,32 @@ function freshOptimize(
   // Per spec: maximise EV, tie-break on minimum remaining budget
   if (bestD.length < 5) {
     // Greedy fallback: sort all by EV desc, pick as many as fit in budget
-    const sortedD = [...allDrivers].sort((a,b) => b.ev - a.ev);
-    const sortedC = [...allConstrs].sort((a,b) => b.ev - a.ev);
-    let rem = budget;
-    const pickedD: typeof allDrivers = [];
-    const pickedC: typeof allConstrs = [];
-    // Pick top 2 constructors first
-    for (const c of sortedC) {
-      if (pickedC.length >= 2) break;
-      if (rem - c.price >= 0) { pickedC.push(c); rem -= c.price; }
-    }
-    // Pick top 5 drivers from remaining budget
-    for (const d of sortedD) {
-      if (pickedD.length >= 5) break;
-      if (rem - d.price >= 0) { pickedD.push(d); rem -= d.price; }
-    }
-    if (pickedD.length === 5 && pickedC.length === 2) {
-      bestD = pickedD.map(d => d.code);
-      bestC = pickedC.map(c => c.id);
-      bestCost = budget - rem;
-      const boostEV = Math.max(...pickedD.map(d => d.ev));
-      bestTeamEV = pickedD.reduce((s,d)=>s+d.ev,0) + pickedC.reduce((s,c)=>s+c.ev,0) + boostEV;
-      bestBoost = pickedD.find(d => d.ev === boostEV)?.code ?? pickedD[0].code;
-      bestRemaining = rem;
+    // Fallback: try constructor pairs cheapest-first, fill drivers by EV desc
+    const sortedCbyPrice = [...allConstrs].sort((a,b) => a.price - b.price);
+    const sortedDbyEV    = [...allDrivers].sort((a,b) => b.ev - a.ev);
+    outer:
+    for (let ca = 0; ca < sortedCbyPrice.length - 1; ca++) {
+      for (let cb = ca + 1; cb < sortedCbyPrice.length; cb++) {
+        const cCost = sortedCbyPrice[ca].price + sortedCbyPrice[cb].price;
+        const dBudget = budget - cCost;
+        const picked: typeof allDrivers = [];
+        let rem = dBudget;
+        for (const d of sortedDbyEV) {
+          if (picked.length >= 5) break;
+          if (d.price <= rem) { picked.push(d); rem -= d.price; }
+        }
+        if (picked.length === 5) {
+          bestD = picked.map(d => d.code);
+          bestC = [sortedCbyPrice[ca].id, sortedCbyPrice[cb].id];
+          bestCost = cCost + dBudget - rem;
+          const boostEV = Math.max(...picked.map(d => d.ev));
+          bestTeamEV = picked.reduce((s,d)=>s+d.ev,0) +
+            sortedCbyPrice[ca].ev + sortedCbyPrice[cb].ev + boostEV;
+          bestBoost = picked.find(d => d.ev === boostEV)?.code ?? picked[0].code;
+          bestRemaining = budget - bestCost;
+          break outer;
+        }
+      }
     }
   }
 
@@ -942,18 +942,35 @@ export async function POST(req: NextRequest) {
             messages:[{role:"system",content:SYSTEM},{role:"user",content:shortPrompt}],
           }),
         }),
-        new Promise<Response>((_,rej) => setTimeout(()=>rej(new Error("Groq timeout")), 8000)),
+        new Promise<Response>((_,rej) => setTimeout(()=>rej(new Error("Groq timeout")), 6000)),
       ]);
       if (groqRes.ok) {
         const txt = (await groqRes.json()).choices?.[0]?.message?.content??"{}";
         aiParsed = JSON.parse(txt);
         tick("Groq OK");
       } else {
-        tick(`Groq FAIL ${groqRes.status}`);
+        const errTxt = await groqRes.text().catch(()=>"");
+        tick(`Groq FAIL ${groqRes.status}: ${errTxt.slice(0,100)}`);
+        // Groq credit/rate-limit: set fallback analysis
+        aiParsed = {
+          drsBoostRecommendation: {
+            driverId: isFresh ? (optResult.boostDriver??"") : (optResult.recommendedBoost??team?.captain??""),
+            reason: "Vozač s najvišim procijenjenim EV-om u timu."
+          },
+          analysis: `Tim odabran kombinatoričkom optimizacijom (${optResult.considered??0} kombinacija). AI analiza nije dostupna.`,
+          teamRationale: "Prikazani tim maksimizira očekivane bodove unutar budžeta.",
+        };
       }
     } catch(e:any) {
       tick(`Groq ERROR: ${e.message}`);
-      // Continue without AI — return results based on optimizer only
+      aiParsed = {
+        drsBoostRecommendation: {
+          driverId: isFresh ? (optResult.boostDriver??"") : (optResult.recommendedBoost??team?.captain??""),
+          reason: "Vozač s najvišim procijenjenim EV-om u timu."
+        },
+        analysis: `Optimizer je analizirao ${optResult.considered??0} kombinacija. AI analiza nije dostupna (${e.message}).`,
+        teamRationale: "Prikazani tim maksimizira očekivane bodove unutar budžeta.",
+      };
     }
 
     // 5. Build response
@@ -988,7 +1005,7 @@ export async function POST(req: NextRequest) {
       resp.captain               = optResult.boostDriver??"";
       resp.totalCost             = optResult.totalCost??0;
       resp.remainingBudget       = optResult.remainingBudget??0;
-      resp.totalExpectedPoints   = optResult.totalEV??0;
+      resp.totalExpectedPoints   = (optResult.totalEV != null && isFinite(optResult.totalEV)) ? parseFloat(optResult.totalEV.toFixed(1)) : 0;
       resp.archetype             = optResult.archetype??"unknown";
       resp.avoidList             = optResult.avoidList??[];
       resp.considered            = optResult.considered??0;
