@@ -773,258 +773,189 @@ function scoreChips(chips:string[],track:{isSprint:boolean;circuitType:string;ro
 export async function POST(req: NextRequest) {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) return NextResponse.json(
-    {error:"GROQ_API_KEY nije postavljen. Registriraj se na console.groq.com."},{status:500});
+    {error:"GROQ_API_KEY nije postavljen."},{status:500});
+
+  const log: string[] = [];
+  const t0 = Date.now();
+  const tick = (msg: string) => { log.push(`${Date.now()-t0}ms: ${msg}`); console.log(msg); };
 
   try {
+    tick("START parse body");
     const body = await req.json();
     const {mode="existing",team,track,allDriverData={},constructorData={},
       availableChips=[],freeTransfers=2,remainingBudget=2,totalBudget=100} = body;
 
     const isFresh = mode==="fresh";
     const circuitId = CIRCUIT_IDS[track.id]??track.id;
+    tick(`mode=${mode} track=${track.id} circuitId=${circuitId}`);
 
-    // 1. Fetch all data in parallel, with hard caps so slow APIs never block
+    // 1. Fetch external data
     const emptyForm: Record<string, DForm> = {};
     const emptyTrack = { stats: {} as Record<string,THistory>, avgDnfRate: 0.08 };
-    const weekendTimeout: WeekendData = {
+    const weekendFallback: WeekendData = {
       qualiSimScores:{}, longRunScores:{}, gridPositions:{},
       sessionsCompleted:0, sessionNames:[], noiseLevel:"high", available:false,
     };
 
-    const [driverForm, {stats:trackStats, avgDnfRate}, weekend] = await Promise.all([
-      Promise.race([getForm(2026),           new Promise<Record<string,DForm>>(r=>setTimeout(()=>r(emptyForm), 7000))]),
-      Promise.race([getTrackHistory(circuitId), new Promise<typeof emptyTrack>(r=>setTimeout(()=>r(emptyTrack), 7000))]),
-      Promise.race([getWeekendData(track.id, 2026), new Promise<WeekendData>(r=>setTimeout(()=>r(weekendTimeout), 7000))]),
+    tick("START parallel fetch");
+    const [driverForm, trackResult, weekend] = await Promise.all([
+      Promise.race([
+        getForm(2026),
+        new Promise<Record<string,DForm>>(r=>setTimeout(()=>r(emptyForm), 6000)),
+      ]),
+      Promise.race([
+        getTrackHistory(circuitId),
+        new Promise<typeof emptyTrack>(r=>setTimeout(()=>r(emptyTrack), 6000)),
+      ]),
+      Promise.race([
+        getWeekendData(track.id, 2026),
+        new Promise<WeekendData>(r=>setTimeout(()=>r(weekendFallback), 6000)),
+      ]),
     ]);
+    const {stats:trackStats, avgDnfRate} = trackResult;
+    tick(`fetch done: form=${Object.keys(driverForm).length} drivers, track=${Object.keys(trackStats).length}, weekend=${weekend.available}`);
 
-    // 2. Calculate EV for all assets using full spec formula
+    // 2. EV calculation
+    tick("START EV calc");
     const evMap: Record<string,{ev:number,confidence:"HIGH"|"MEDIUM"|"LOW",components:any}> = {};
-
     for (const [code,d] of Object.entries(allDriverData as Record<string,any>)) {
-      const result = calcEV(code,(d as any).team,driverForm,trackStats,weekend,track.id,track.isSprint);
-      evMap[code] = result;
+      evMap[code] = calcEV(code,(d as any).team,driverForm,trackStats,weekend,track.id,track.isSprint);
     }
     for (const [id,c] of Object.entries(constructorData as Record<string,any>)) {
       const dCodes:string[]=(c as any).drivers??[];
       const dSum = dCodes.reduce((s,dc)=>s+(evMap[dc]?.ev??0),0);
-      const constrEV = dSum > 0 ? dSum + 6 : (
-        (DRIVER_BASELINE[id] ?? 15) * (TEAM_FACTOR[id] ?? 0.85)
-      );
-      // Constructor confidence = min confidence of its drivers
+      const constrEV = dSum > 0 ? dSum + 6 : (DRIVER_BASELINE[id]??15)*(TEAM_FACTOR[id]??0.85);
       const confs = dCodes.map(dc=>evMap[dc]?.confidence??"LOW");
-      const conf = confs.every(c=>c==="HIGH") ? "HIGH" :
-                   confs.some(c=>c==="MEDIUM") ? "MEDIUM" : "LOW";
-      evMap[id] = { ev: parseFloat(constrEV.toFixed(1)), confidence: conf, components:{} };
+      const conf = confs.every(c=>c==="HIGH")?"HIGH":confs.some(c=>c==="MEDIUM")?"MEDIUM":"LOW";
+      evMap[id] = { ev:parseFloat(constrEV.toFixed(1)), confidence:conf, components:{} };
     }
+    tick(`EV done: ${Object.keys(evMap).length} assets`);
 
-    // 3. Run pipeline or fresh optimizer
+    // 3. Optimize
     const pred = Math.max(0,Math.min(1,1-avgDnfRate*2.5-(track.circuitType==="street"?0.2:0)));
     const chipScores = scoreChips(availableChips, track, 22, avgDnfRate, pred);
-
     let optResult: any = {};
     let noTransferScore = 0;
 
+    tick("START optimizer");
     if (isFresh) {
       const dOpts = Object.entries(allDriverData as Record<string,any>)
         .map(([code,d]:any)=>({
-          code,
-          price: d.price as number,
-          ev: evMap[code]?.ev ?? 0,
-          dnfRate: driverForm[code]?.dnfRate ?? 0.08,
-          avgPts:  driverForm[code]?.avgPts  ?? 0,
+          code, price:d.price as number, ev:evMap[code]?.ev??0,
+          dnfRate:driverForm[code]?.dnfRate??0.08,
+          avgPts:driverForm[code]?.avgPts??0,
         }));
       const cOpts = Object.entries(constructorData as Record<string,any>)
         .map(([id,c]:any)=>({id, price:c.price as number, ev:evMap[id]?.ev??0}));
       optResult = freshOptimize(dOpts, cOpts, totalBudget);
+      tick(`fresh optimizer done: ${optResult.drivers?.join(",")} | cost=$${optResult.totalCost} | EV=${optResult.totalEV}`);
     } else {
       const cur = team?.drivers??[], curC = team?.constructors??[];
       const pipeResult = pipelineOptimize(
-        cur, curC, team?.captain ?? "",
-        allDriverData, constructorData, evMap,
+        cur, curC, team?.captain??"", allDriverData, constructorData, evMap,
         remainingBudget, freeTransfers, weekend
       );
       noTransferScore = pipeResult.noTransferScore;
       optResult = pipeResult;
+      tick(`transfer optimizer done: ${optResult.transfers?.length} transfers`);
     }
 
-    // 4. Build AI prompt with full context
-    const teamCodes = isFresh ? optResult.drivers : (team?.drivers??[]);
-    const allCodes = [...teamCodes,...(isFresh?optResult.constructors:(team?.constructors??[]))];
+    // 4. Build Groq prompt (trimmed to avoid large payloads)
+    tick("START Groq");
+    const teamCodes = isFresh ? (optResult.drivers??[]) : (team?.drivers??[]);
+    const allCodes = [...teamCodes,...(isFresh?optResult.constructors??[]:(team?.constructors??[]))];
+    const evLines = allCodes.map((c:string)=>`${c}:${evMap[c]?.ev?.toFixed(1)}[${evMap[c]?.confidence}]`).join(" ");
 
-    const evSummary = allCodes.map((code:string) => {
-      const {ev,confidence,components} = evMap[code]??{ev:0,confidence:"LOW",components:{}};
-      const qs = weekend.qualiSimScores[code]?.toFixed(2);
-      const lr = weekend.longRunScores[code]?.toFixed(2);
-      return `${code}: EV=${ev}pts [${confidence}]` +
-        (qs?` | quali-sim=${qs}`:"") +
-        (lr?` | long-run=${lr}`:"") +
-        (components?.riskPenalty?` | risk-pen=${components.riskPenalty}pts`:"");
-    }).join("\n");
+    const SYSTEM = `F1 Fantasy analitičar. Odgovaraj kratko u JSON formatu na bosanskom/hrvatskom.`;
 
-    const weakLinkSummary = !isFresh && optResult.weakLinks?.length > 0
-      ? "Slabe karike: " + optResult.weakLinks.map((w:any)=>`${w.code}(${w.type}: ${w.reason})`).join(", ")
-      : "Nema identificiranih slabih karika.";
+    const shortPrompt = isFresh
+      ? `Tim za ${track.name} R${track.round}: vozači=${optResult.drivers?.join(",")} konstruktori=${optResult.constructors?.join(",")} boost=${optResult.boostDriver} cijena=$${optResult.totalCost}M EV=${optResult.totalEV}pts arhetip=${optResult.archetype}. EV: ${evLines}. Vrati JSON: {"drsBoostRecommendation":{"driverId":"${optResult.boostDriver}","reason":"kratko"},"teamRationale":"1-2 rečenice","analysis":"1-2 rečenice"}`
+      : `Tim za ${track.name}: ${team?.drivers?.join(",")} | boost=${team?.captain} | budžet=$${remainingBudget}M | transferi=${freeTransfers}. EV: ${evLines}. Transferi: ${optResult.transfers?.map((t:any)=>`${t.out}→${t.in}+${t.deltaEV}pts`).join(" ")||"nema"}. Vrati JSON: {"drsBoostRecommendation":{"driverId":"${optResult.recommendedBoost||team?.captain}","reason":"kratko"},"analysis":"1-2 rečenice"}`;
 
-    const sessInfo = weekend.available
-      ? `Sesije: ${weekend.sessionNames.join(", ")} | Noise: ${weekend.noiseLevel} | Sesije treninga: ${weekend.sessionsCompleted}/3`
-      : "Nema vikend podataka iz OpenF1.";
-
-    const pipelineSummary = isFresh ? "" : `
-PIPELINE REZULTAT:
-Preporučeni boost: ${optResult.recommendedBoost}${optResult.boostChanged?" (PROMJENA)":""}
-${weakLinkSummary}
-Transferi: ${optResult.transfers?.length??0}
-Sesijsko upozorenje: ${optResult.sessionsWarning ?? "—"}`;
-
-    const SYSTEM = `Ti si ekspert F1 Fantasy analitičar koji slijedi logiku iz specifikacije:
-1. Odluka se donosi PRIJE qualifyinga — trening je primarni on-track signal.
-2. Razlikuješ quali-sim pace (kratki run) i long-run pace (race pace).
-3. Boost je besplatna poluga, optimizira se neovisno.
-4. Naplativi transfer preporučuješ SAMO ako ΔEV > kazna (10 bodova).
-5. Visok šum iz treninga → više se osloni na formu i historiju staze.
-6. Eksplicitno naznači razinu pouzdanosti procjene.
-Odgovaraj u JSON formatu, na HRVATSKOM ili BOSANSKOM jeziku.`;
-
-    const prompt = isFresh
-      ? `Optimalni novi tim za ${track.name} R${track.round} (sprint:${track.isSprint?"DA":"NE"}, cap $${totalBudget}M):
-
-ODABRANI TIM (kombinatorička pretraga, max team EV s boostom):
-  Vozači: ${optResult.drivers?.join(", ")}
-  Konstruktori: ${optResult.constructors?.join(", ")}
-  2× Boost: ${optResult.boostDriver} (najviši EV u timu)
-  Ukupna cijena: $${optResult.totalCost}M (preostalo: $${optResult.remainingBudget}M)
-  Team EV (s boostom): ${optResult.totalEV?.toFixed(1)}pts
-  Arhetip: ${optResult.archetype === "stars_and_scrubs" ? "Stars & Scrubs (2 Tier-A konstruktora)" : "Balanced (mješoviti konstruktori, dublja vozačka linija)"}
-
-EV PO ASSETU:
-${evSummary}
-
-AVOID LISTA (filtrirani iz pretrage):
-${optResult.avoidList?.length > 0
-  ? optResult.avoidList.map((a:any)=>`  ${a.code} ($${a.price}M, EV=${a.ev}): ${a.reason}`).join("\n")
-  : "  Nema filtiranih asseta."}
-
-${sessInfo}
-
-Objasni ZAŠTO je ovaj tim optimalan prema spec-u (boost sidro, konstruktorska jezgra, arhetip, avoid lista).
-Vrati JSON:
-{
-  "drsBoostRecommendation": {
-    "driverId": "${optResult.boostDriver}",
-    "reason": "Zašto ovaj vozač nosi boost — EV, forma, historija staze."
-  },
-  "teamRationale": "2-3 rečenice: arhetip, konstruktorska jezgra, zašto je ostatak tima odabran.",
-  "assetReasons": {
-    "${optResult.drivers?.[0]??''}": "razlog",
-    "${optResult.drivers?.[1]??''}": "razlog",
-    "${optResult.constructors?.[0]??''}": "razlog",
-    "${optResult.constructors?.[1]??''}": "razlog"
-  },
-  "avoidRationale": "Kratko zašto su filtrirani asseti izostavljeni.",
-  "confidenceNote": "Razina pouzdanosti procjene (pred-trening / sesije učitane / qualifying učitan).",
-  "analysis": "Sažetak strategije za ovaj vikend."
-}`
-
-      : `Tim za ${track.name} R${track.round} (sprint:${track.isSprint?"DA":"NE"}):
-TIM: ${team?.drivers?.join(", ")} | ${team?.constructors?.join(", ")}
-BOOST: ${team?.captain} | BUDŽET: $${remainingBudget}M | SLOBODNI: ${freeTransfers}
-${sessInfo}
-${pipelineSummary}
-EV PO VOZAČU:
-${evSummary}
-TRANSFERI: ${optResult.transfers?.map((t:any)=>
-  `${t.out}→${t.in}(${t.isFree?"bespl.":"-10pts"} ΔEV+${t.deltaEV} neto+${t.netGain}pts, conf:${t.inConfidence})`
-).join(" | ")||"—"}
-Vrati JSON: {
-  "drsBoostRecommendation":{"driverId":"${optResult.recommendedBoost}","reason":"..."},
-  "boostChangedReason": "${optResult.boostChanged?"zašto je boost promijenjen":""}",
-  "analysis":"2-3 rečenice s referencom na EV, trening signale i razinu pouzdanosti"
-}`;
-
-    const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method:"POST",
-      headers:{"Authorization":`Bearer ${apiKey}`,"Content-Type":"application/json"},
-      body:JSON.stringify({
-        model:"llama-3.3-70b-versatile",temperature:0.2,max_tokens:700,
-        response_format:{type:"json_object"},
-        messages:[{role:"system",content:SYSTEM},{role:"user",content:prompt}],
-      }),
-    });
-
-    if(!groqRes.ok){const err=await groqRes.text();return NextResponse.json({error:`Groq: ${err}`},{status:500});}
-    let aiParsed:any={};
-    try{aiParsed=JSON.parse((await groqRes.json()).choices?.[0]?.message?.content??"{}"); }catch{}
+    let aiParsed:any = {};
+    try {
+      const groqRes = await Promise.race([
+        fetch("https://api.groq.com/openai/v1/chat/completions", {
+          method:"POST",
+          headers:{"Authorization":`Bearer ${apiKey}`,"Content-Type":"application/json"},
+          body:JSON.stringify({
+            model:"llama-3.3-70b-versatile", temperature:0.2, max_tokens:400,
+            response_format:{type:"json_object"},
+            messages:[{role:"system",content:SYSTEM},{role:"user",content:shortPrompt}],
+          }),
+        }),
+        new Promise<Response>((_,rej) => setTimeout(()=>rej(new Error("Groq timeout")), 8000)),
+      ]);
+      if (groqRes.ok) {
+        const txt = (await groqRes.json()).choices?.[0]?.message?.content??"{}";
+        aiParsed = JSON.parse(txt);
+        tick("Groq OK");
+      } else {
+        tick(`Groq FAIL ${groqRes.status}`);
+      }
+    } catch(e:any) {
+      tick(`Groq ERROR: ${e.message}`);
+      // Continue without AI — return results based on optimizer only
+    }
 
     // 5. Build response
+    tick("START build response");
     const expPts = Object.fromEntries(Object.entries(evMap).map(([k,v])=>[k,parseFloat(v.ev.toFixed(1))]));
-    const expConf = Object.fromEntries(Object.entries(evMap).map(([k,v])=>[k,v.confidence]));
 
     const resp: any = {
       mode,
       chipRecommendations: chipScores,
       bestChip: chipScores[0]?.chip??"",
       drsBoostRecommendation: aiParsed.drsBoostRecommendation ?? {
-        driverId: isFresh ? (optResult.drivers?.[0]??"") : (optResult.recommendedBoost??""),
-        reason: "Najviši EV u timu.",
+        driverId: isFresh ? (optResult.boostDriver??"") : (optResult.recommendedBoost??""),
+        reason: "Najviši EV u timu ovaj vikend.",
       },
       analysis: aiParsed.analysis??"",
       allExpectedPts: expPts,
-      allConfidence: expConf,
       dataStatus:{
         form2026: Object.keys(driverForm).length>0?"OK":"UNAVAILABLE",
         trackHistory: Object.keys(trackStats).length>0?"OK":"UNAVAILABLE",
-        weekendSessions: weekend.sessionNames,
-        weekendData: weekend.available ? `${weekend.sessionsCompleted} treninga` : "UNAVAILABLE",
+        weekendData: weekend.available?`${weekend.sessionsCompleted} sesija`:"UNAVAILABLE",
         gridAvailable: Object.keys(weekend.gridPositions).length>0,
         noiseLevel: weekend.noiseLevel,
         transfersConsidered: optResult.considered??0,
+        _log: log,
       },
     };
 
     if(isFresh){
-      resp.suggestedDrivers   = optResult.drivers;
-      resp.suggestedConstructors = optResult.constructors;
-      resp.boostDriver        = optResult.boostDriver;
-      resp.captain            = optResult.boostDriver;   // boost = DRS captain
-      resp.totalCost          = optResult.totalCost;
-      resp.remainingBudget    = optResult.remainingBudget;
-      resp.totalExpectedPoints = optResult.totalEV;
-      resp.archetype          = optResult.archetype;
-      resp.avoidList          = optResult.avoidList ?? [];
-      resp.considered         = optResult.considered ?? 0;
-      // AI fields
-      resp.teamRationale      = aiParsed.teamRationale ?? "";
-      resp.assetReasons       = aiParsed.assetReasons  ?? {};
-      resp.avoidRationale     = aiParsed.avoidRationale ?? "";
-      resp.confidenceNote     = aiParsed.confidenceNote ?? "";
-      resp.analysis           = aiParsed.analysis ?? "";
-      resp.drsBoostRecommendation = {
-        driverId: optResult.boostDriver,
-        reason: aiParsed.drsBoostRecommendation?.reason ?? `${optResult.boostDriver} ima najviši EV u timu.`,
+      resp.suggestedDrivers      = optResult.drivers??[];
+      resp.suggestedConstructors = optResult.constructors??[];
+      resp.boostDriver           = optResult.boostDriver??"";
+      resp.captain               = optResult.boostDriver??"";
+      resp.totalCost             = optResult.totalCost??0;
+      resp.remainingBudget       = optResult.remainingBudget??0;
+      resp.totalExpectedPoints   = optResult.totalEV??0;
+      resp.archetype             = optResult.archetype??"unknown";
+      resp.avoidList             = optResult.avoidList??[];
+      resp.considered            = optResult.considered??0;
+      resp.teamRationale         = aiParsed.teamRationale??"";
+      resp.recommendedTeam       = {
+        drivers: optResult.drivers??[],
+        constructors: optResult.constructors??[],
+        changedDrivers: optResult.drivers??[],
+        changedConstructors: optResult.constructors??[],
+        unchanged: false,
       };
       resp.predictedPoints    = Object.fromEntries((optResult.drivers??[]).map((c:string)=>[c,expPts[c]??0]));
       resp.constructorPoints  = Object.fromEntries((optResult.constructors??[]).map((c:string)=>[c,expPts[c]??0]));
-      // Build recommendedTeam for ResultView compatibility
-      resp.recommendedTeam    = {
-        drivers: optResult.drivers,
-        constructors: optResult.constructors,
-        changedDrivers: optResult.drivers,
-        changedConstructors: optResult.constructors,
-        unchanged: false,
-      };
     } else {
       const fc=optResult.transfers?.filter((t:any)=>t.isFree).length??0;
       const pc=optResult.transfers?.filter((t:any)=>!t.isFree).length??0;
-      resp.transfers=optResult.transfers??[];
-      resp.weakLinks=optResult.weakLinks??[];
-      resp.boostChanged=optResult.boostChanged;
-      resp.boostChangedReason=aiParsed.boostChangedReason??"";
-      resp.sessionsWarning=optResult.sessionsWarning;
-      resp.totalExpectedPoints=noTransferScore;
-      resp.totalExpectedPointsAfterTransfers=parseFloat((noTransferScore+(optResult.totalNetGain??0)).toFixed(1));
-      resp.totalTransferCost=pc*10;
-      resp.totalNetGain=optResult.totalNetGain??0;
-      resp.recommendedTeam={
+      resp.transfers         = optResult.transfers??[];
+      resp.weakLinks         = optResult.weakLinks??[];
+      resp.boostChanged      = optResult.boostChanged??false;
+      resp.sessionsWarning   = optResult.sessionsWarning??null;
+      resp.totalExpectedPoints = noTransferScore;
+      resp.totalExpectedPointsAfterTransfers = parseFloat((noTransferScore+(optResult.totalNetGain??0)).toFixed(1));
+      resp.totalTransferCost = pc*10;
+      resp.totalNetGain      = optResult.totalNetGain??0;
+      resp.recommendedTeam   = {
         drivers:[...(team?.drivers??[])].map((id:string)=>{
           const t=optResult.transfers?.find((t:any)=>t.out===id&&!t.isConstructor);
           return t?t.in:id;
@@ -1037,13 +968,22 @@ Vrati JSON: {
         changedConstructors:optResult.transfers?.filter((t:any)=>t.isConstructor).map((t:any)=>t.in)??[],
         unchanged:(optResult.transfers?.length??0)===0,
       };
-      resp.transferSummary=resp.transfers.length===0
+      resp.transferSummary   = resp.transfers.length===0
         ?"Nema isplativih transfera ovaj vikend."
         :`${fc} besplatn${fc===1?"i":"a"} transfer${pc>0?` + ${pc} plaćen${pc===1?"i":"a"} (−${pc*10} pts)`:""} · neto: +${resp.totalNetGain} pts`;
-      resp.predictedPoints=Object.fromEntries((team?.drivers??[]).map((c:string)=>[c,expPts[c]??0]));
-      resp.constructorPoints=Object.fromEntries((team?.constructors??[]).map((c:string)=>[c,expPts[c]??0]));
+      resp.predictedPoints   = Object.fromEntries((team?.drivers??[]).map((c:string)=>[c,expPts[c]??0]));
+      resp.constructorPoints = Object.fromEntries((team?.constructors??[]).map((c:string)=>[c,expPts[c]??0]));
     }
 
+    tick("DONE");
     return NextResponse.json(resp);
-  } catch(err:any){ return NextResponse.json({error:err.message},{status:500}); }
+
+  } catch(err:any) {
+    console.error("PREDICT ERROR:", err);
+    return NextResponse.json({
+      error: err.message ?? "Nepoznata greška",
+      stack: err.stack?.slice(0, 500),
+      log,
+    }, {status: 500});
+  }
 }
