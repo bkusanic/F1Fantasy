@@ -41,12 +41,30 @@ const CIRCUIT_IDS: Record<string, string> = {
 };
 
 // ─── OpenF1 circuit names ─────────────────────────────────────────────────────
-const OPENF1_CIRCUIT: Record<string, string> = {
-  aus:"Albert Park", chn:"Shanghai", jpn:"Suzuka", mia:"Miami", can:"Villeneuve",
-  mon:"Monaco", esp:"Catalunya", aut:"Red Bull Ring", gbr:"Silverstone", bel:"Spa-Francorchamps",
-  hun:"Hungaroring", nld:"Zandvoort", ita:"Monza", mad:"Madrid", aze:"Baku",
-  sgp:"Marina Bay", usc:"Circuit of The Americas", bra:"Interlagos",
-  lvg:"Las Vegas", mex:"Rodriguez", qat:"Lusail", abu:"Yas Marina",
+const OPENF1_CIRCUIT: Record<string, string[]> = {
+  // Primary name first, then alternatives — tried in order until one works
+  aus: ["Albert Park", "Melbourne"],
+  chn: ["Shanghai", "Shanghai International Circuit"],
+  jpn: ["Suzuka", "Suzuka Circuit"],
+  mia: ["Miami", "Miami International Autodrome"],
+  can: ["Circuit Gilles Villeneuve", "Villeneuve", "Montreal"],
+  mon: ["Monaco", "Circuit de Monaco"],
+  esp: ["Catalunya", "Circuit de Barcelona-Catalunya", "Barcelona"],
+  aut: ["Red Bull Ring", "Spielberg"],
+  gbr: ["Silverstone", "Silverstone Circuit"],
+  bel: ["Spa-Francorchamps", "Spa"],
+  hun: ["Hungaroring", "Budapest"],
+  nld: ["Zandvoort", "Circuit Zandvoort"],
+  ita: ["Monza", "Autodromo Nazionale Monza"],
+  mad: ["Madrid", "Circuit Madrid"],
+  aze: ["Baku", "Baku City Circuit"],
+  sgp: ["Marina Bay", "Marina Bay Street Circuit"],
+  usc: ["Circuit of The Americas", "COTA", "Austin"],
+  bra: ["Interlagos", "Autódromo José Carlos Pace", "São Paulo"],
+  lvg: ["Las Vegas", "Las Vegas Strip Circuit"],
+  mex: ["Rodríguez", "Rodriguez", "Autodromo Hermanos Rodriguez", "Mexico City"],
+  qat: ["Lusail", "Lusail International Circuit"],
+  abu: ["Yas Marina", "Yas Marina Circuit"],
 };
 
 // ─── Driver & team baselines (2026 calibrated) ────────────────────────────────
@@ -159,14 +177,21 @@ async function getWeekendData(trackId: string, year: number): Promise<WeekendDat
     sessionsCompleted:0, sessionNames:[], noiseLevel:"high", available:false,
   };
   try {
-    const cName = OPENF1_CIRCUIT[trackId];
-    if (!cName) return empty;
+    const circuitNames = OPENF1_CIRCUIT[trackId] ?? [];
+    if (!circuitNames.length) return empty;
 
-    const sessRes = await fetchT(
-      `https://api.openf1.org/v1/sessions?year=${year}&circuit_short_name=${encodeURIComponent(cName)}`,
-      { next: { revalidate: 300 } }, 5000);
-    if (!sessRes.ok) return empty;
-    const allSessions: any[] = await sessRes.json();
+    // Try each name variant until one returns sessions
+    let allSessions: any[] = [];
+    for (const cName of circuitNames) {
+      try {
+        const sessRes = await fetchT(
+          `https://api.openf1.org/v1/sessions?year=${year}&circuit_short_name=${encodeURIComponent(cName)}`,
+          { next: { revalidate: 300 } }, 4000);
+        if (!sessRes.ok) continue;
+        const data: any[] = await sessRes.json();
+        if (Array.isArray(data) && data.length > 0) { allSessions = data; break; }
+      } catch { continue; }
+    }
 
     const now = new Date();
     const completed = allSessions.filter(s => new Date(s.date_end ?? s.date_start) <= now);
@@ -423,18 +448,20 @@ function freshOptimize(
   budget: number
 ): FreshResult {
 
-  // ── Build avoid list (spec §3 Korak 5) ──────────────────────────────────
+  // ── Build avoid list (informational only — NOT a hard filter) ───────────
+  // Per spec: "osim ako su u optimalnom rješenju zbog visokog EV-a"
+  // → avoid list is shown to the user, optimizer runs on ALL drivers
   const avoidList: FreshResult["avoidList"] = [];
   for (const d of allDrivers) {
-    if (d.dnfRate > AVOID_DNF_THRESHOLD && d.avgPts < 0) {
+    // Only flag truly unreliable drivers (>50% DNF AND deeply negative avg)
+    if (d.dnfRate > 0.50 && d.avgPts < -8) {
       avoidList.push({ code:d.code, price:d.price, ev:d.ev,
-        reason:`DNF rizik ${Math.round(d.dnfRate*100)}% + negativna forma (avg ${d.avgPts.toFixed(1)}pts)` });
+        reason:`DNF rizik ${Math.round(d.dnfRate*100)}% + loša forma (avg ${d.avgPts.toFixed(1)}pts)` });
     }
   }
-  const avoidCodes = new Set(avoidList.map(a => a.code));
 
-  // Eligible drivers after avoid filter
-  const drivers = allDrivers.filter(d => !avoidCodes.has(d.code));
+  // Optimizer runs on ALL drivers — avoid list is just shown to user
+  const drivers = allDrivers;
   const constrs  = allConstrs;
 
   // Sort by EV/price ratio for pruning (doesn't affect correctness — only speed)
@@ -505,10 +532,40 @@ function freshOptimize(
   const archetype: FreshResult["archetype"] =
     tierAConstrs >= 2 ? "stars_and_scrubs" : "balanced";
 
+  // Fallback if no valid team found (should not happen with proper prices)
+  // Per spec: maximise EV, tie-break on minimum remaining budget
+  if (bestD.length < 5) {
+    // Greedy fallback: sort all by EV desc, pick as many as fit in budget
+    const sortedD = [...allDrivers].sort((a,b) => b.ev - a.ev);
+    const sortedC = [...allConstrs].sort((a,b) => b.ev - a.ev);
+    let rem = budget;
+    const pickedD: typeof allDrivers = [];
+    const pickedC: typeof allConstrs = [];
+    // Pick top 2 constructors first
+    for (const c of sortedC) {
+      if (pickedC.length >= 2) break;
+      if (rem - c.price >= 0) { pickedC.push(c); rem -= c.price; }
+    }
+    // Pick top 5 drivers from remaining budget
+    for (const d of sortedD) {
+      if (pickedD.length >= 5) break;
+      if (rem - d.price >= 0) { pickedD.push(d); rem -= d.price; }
+    }
+    if (pickedD.length === 5 && pickedC.length === 2) {
+      bestD = pickedD.map(d => d.code);
+      bestC = pickedC.map(c => c.id);
+      bestCost = budget - rem;
+      const boostEV = Math.max(...pickedD.map(d => d.ev));
+      bestTeamEV = pickedD.reduce((s,d)=>s+d.ev,0) + pickedC.reduce((s,c)=>s+c.ev,0) + boostEV;
+      bestBoost = pickedD.find(d => d.ev === boostEV)?.code ?? pickedD[0].code;
+      bestRemaining = rem;
+    }
+  }
+
   return {
-    drivers: bestD.length === 5 ? bestD : allDrivers.sort((a,b)=>b.ev-a.ev).slice(0,5).map(d=>d.code),
-    constructors: bestC.length === 2 ? bestC : allConstrs.sort((a,b)=>b.ev-a.ev).slice(0,2).map(c=>c.id),
-    boostDriver: bestBoost || (bestD[0] ?? ""),
+    drivers: bestD,
+    constructors: bestC,
+    boostDriver: bestBoost,
     totalCost: parseFloat(bestCost.toFixed(1)),
     remainingBudget: parseFloat((budget - bestCost).toFixed(1)),
     totalEV: parseFloat(bestTeamEV.toFixed(1)),

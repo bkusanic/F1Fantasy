@@ -885,10 +885,12 @@ function ResultView({
   };
 
   // Current total vs recommended total
-  const curTotal = prediction.totalExpectedPoints ?? 0;
-  const recTotal = isFresh
+  const _rawCur = prediction.totalExpectedPoints;
+  const _rawRec = isFresh
     ? prediction.totalExpectedPoints
-    : (prediction.totalExpectedPointsAfterTransfers ?? prediction.totalExpectedPoints ?? 0);
+    : (prediction.totalExpectedPointsAfterTransfers ?? prediction.totalExpectedPoints);
+  const curTotal = (_rawCur != null && isFinite(_rawCur)) ? _rawCur : 0;
+  const recTotal = (_rawRec != null && isFinite(_rawRec)) ? _rawRec : 0;
   const netDelta = parseFloat((recTotal - curTotal).toFixed(1));
 
   // Changes
@@ -993,14 +995,16 @@ function ResultView({
     );
   };
 
-  const TotalBar = ({ total, delta, label }: { total: number; delta?: number; label: string }) => (
+  const TotalBar = ({ total, delta, label }: { total: number | null | undefined; delta?: number; label: string }) => {
+    const safeTotal = (total != null && isFinite(total)) ? total : null;
+    return (
     <div style={{ padding: "14px 16px", background: S.card2, borderRadius: 3, marginTop: 8,
       borderTop: `1px solid ${S.border}`, borderRight: `1px solid ${S.border}`,
       borderBottom: `1px solid ${S.border}`, borderLeft: `4px solid ${T.red}` }}>
       <div style={{ fontSize: 11, color: S.muted, letterSpacing: "0.15em", marginBottom: 4 }}>{label}</div>
       <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
         <span style={{ fontSize: 36, fontWeight: 900, color: S.gold, fontFamily: "monospace" }}>
-          {total.toFixed(1)}
+          {safeTotal != null ? safeTotal.toFixed(1) : "—"}
         </span>
         {delta !== undefined && delta > 0 && (
           <span style={{ fontSize: 18, fontWeight: 900, color: "#4ADE80", fontFamily: "monospace" }}>
@@ -1010,7 +1014,7 @@ function ResultView({
         <span style={{ fontSize: 13, color: S.muted }}>pts</span>
       </div>
     </div>
-  );
+  );};
 
   // Build tooltip content for each transfer
   const getTransferTooltip = (t: any) => {
