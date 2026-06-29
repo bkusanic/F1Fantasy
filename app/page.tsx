@@ -1400,6 +1400,28 @@ function ResultView({
           </div>
         )}
 
+        {/* Price warning — always shown for fresh mode */}
+        {isFresh && (
+          <div style={{ maxWidth:1100, margin:"8px auto 4px", padding:"0 16px" }}>
+            <div style={{ background:"#FF800018", border:`1px solid #FF800060`,
+              borderRadius:4, padding:"10px 16px",
+              display:"flex", alignItems:"flex-start", gap:10 }}>
+              <span style={{ fontSize:16, flexShrink:0 }}>⚠️</span>
+              <div>
+                <div style={{ fontSize:13, color:"#FF8000", fontWeight:700, marginBottom:3 }}>
+                  Provjeri cijene u F1 Fantasy builderu!
+                </div>
+                <div style={{ fontSize:12, color:S.silver, lineHeight:1.6 }}>
+                  Cijene vozača i konstruktora mijenjaju se nakon svake utrke.
+                  Naše cijene su ažurirane za R9 British GP — ali potvrdi u builderu
+                  da ukupna cijena tima stane unutar $100M prije zaključavanja.
+                  Ako ne stane, zamijeni najskupljeg punioca jeftinijom opcijom.
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Confidence note (fresh only) */}
         {isFresh && prediction.confidenceNote && (
           <div style={{ maxWidth:1100, margin:"8px auto 16px", padding:"0 16px" }}>
