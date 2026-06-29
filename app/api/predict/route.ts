@@ -1,6 +1,22 @@
 import { NextRequest, NextResponse } from "next/server";
 
-// ─── Track constants ──────────────────────────────────────────────────────────
+// Vercel: allow up to 60s (Pro) / 15s (Hobby).
+// Without this, Hobby plan cuts off at 10s which isn't enough.
+export const maxDuration = 60;
+export const runtime = "nodejs";
+
+// ─── Fetch with timeout ───────────────────────────────────────────────────────
+async function fetchT(url: string, options: RequestInit & {next?: any} = {}, timeoutMs = 5000): Promise<Response> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+
 /** How easy it is to overtake on this circuit (0=Monaco, 1=Monza) */
 const TRACK_OVERTAKING: Record<string, number> = {
   mon: 0.05, sgp: 0.15, hun: 0.20, mad: 0.25,
@@ -62,8 +78,8 @@ interface DForm { avgPts: number; dnfRate: number; races: number }
 async function getForm(season: number): Promise<Record<string, DForm>> {
   const s: Record<string,{total:number,races:number,dnfs:number}> = {};
   try {
-    const r = await fetch(`https://api.jolpi.ca/ergast/f1/${season}/results.json?limit=200`,
-      { next: { revalidate: 3600 } });
+    const r = await fetchT(`https://api.jolpi.ca/ergast/f1/${season}/results.json?limit=200`,
+      { next: { revalidate: 3600 } }, 8000);
     if (!r.ok) return {};
     const data = (await r.json())?.MRData;
     for (const race of data?.RaceTable?.Races ?? []) {
@@ -93,9 +109,9 @@ async function getTrackHistory(circuitId: string): Promise<{stats:Record<string,
   let td=0, te=0;
   for (const year of [2023,2024,2025]) {
     try {
-      const r = await fetch(
+      const r = await fetchT(
         `https://api.jolpi.ca/ergast/f1/${year}/circuits/${circuitId}/results.json?limit=50`,
-        { next: { revalidate: 86400 } });
+        { next: { revalidate: 86400 } }, 6000);
       if (!r.ok) continue;
       const race = (await r.json())?.MRData?.RaceTable?.Races?.[0];
       if (!race) continue;
@@ -141,9 +157,9 @@ async function getWeekendData(trackId: string, year: number): Promise<WeekendDat
     const cName = OPENF1_CIRCUIT[trackId];
     if (!cName) return empty;
 
-    const sessRes = await fetch(
+    const sessRes = await fetchT(
       `https://api.openf1.org/v1/sessions?year=${year}&circuit_short_name=${encodeURIComponent(cName)}`,
-      { next: { revalidate: 300 } });
+      { next: { revalidate: 300 } }, 5000);
     if (!sessRes.ok) return empty;
     const allSessions: any[] = await sessRes.json();
 
@@ -162,8 +178,8 @@ async function getWeekendData(trackId: string, year: number): Promise<WeekendDat
     let gridPositions: Record<string,number> = {};
     if (latestQuali) {
       const [posRes, drRes] = await Promise.all([
-        fetch(`https://api.openf1.org/v1/position?session_key=${latestQuali.session_key}`, { next:{revalidate:300} }),
-        fetch(`https://api.openf1.org/v1/drivers?session_key=${latestQuali.session_key}`, { next:{revalidate:300} }),
+        fetchT(`https://api.openf1.org/v1/position?session_key=${latestQuali.session_key}`, { next:{revalidate:300} }, 5000),
+        fetchT(`https://api.openf1.org/v1/drivers?session_key=${latestQuali.session_key}`, { next:{revalidate:300} }, 5000),
       ]);
       if (posRes.ok && drRes.ok) {
         const positions: any[] = await posRes.json();
@@ -185,8 +201,8 @@ async function getWeekendData(trackId: string, year: number): Promise<WeekendDat
 
     for (const sess of practiceCompleted) {
       const [lapsRes, drRes] = await Promise.all([
-        fetch(`https://api.openf1.org/v1/laps?session_key=${sess.session_key}`, { next:{revalidate:300} }),
-        fetch(`https://api.openf1.org/v1/drivers?session_key=${sess.session_key}`, { next:{revalidate:300} }),
+        fetchT(`https://api.openf1.org/v1/laps?session_key=${sess.session_key}`, { next:{revalidate:300} }, 6000),
+        fetchT(`https://api.openf1.org/v1/drivers?session_key=${sess.session_key}`, { next:{revalidate:300} }, 4000),
       ]);
       if (!lapsRes.ok || !drRes.ok) continue;
 
@@ -515,9 +531,9 @@ function freshOptimize(
     tierAConstrs >= 2 ? "stars_and_scrubs" : "balanced";
 
   return {
-    drivers: bestD,
-    constructors: bestC,
-    boostDriver: bestBoost,
+    drivers: bestD.length === 5 ? bestD : allDrivers.sort((a,b)=>b.ev-a.ev).slice(0,5).map(d=>d.code),
+    constructors: bestC.length === 2 ? bestC : allConstrs.sort((a,b)=>b.ev-a.ev).slice(0,2).map(c=>c.id),
+    boostDriver: bestBoost || (bestD[0] ?? ""),
     totalCost: parseFloat(bestCost.toFixed(1)),
     remainingBudget: parseFloat((budget - bestCost).toFixed(1)),
     totalEV: parseFloat(bestTeamEV.toFixed(1)),
@@ -792,11 +808,19 @@ export async function POST(req: NextRequest) {
     const isFresh = mode==="fresh";
     const circuitId = CIRCUIT_IDS[track.id]??track.id;
 
-    // 1. Fetch all data sources in parallel
+    // 1. Fetch all data in parallel, with a hard 12s cap on weekend data
+    //    so slow OpenF1 never kills the whole prediction
+    const weekendTimeout: WeekendData = {
+      qualiSimScores:{}, longRunScores:{}, gridPositions:{},
+      sessionsCompleted:0, sessionNames:[], noiseLevel:"high", available:false,
+    };
     const [driverForm, {stats:trackStats, avgDnfRate}, weekend] = await Promise.all([
       getForm(2026),
       getTrackHistory(circuitId),
-      getWeekendData(track.id, 2026),
+      Promise.race([
+        getWeekendData(track.id, 2026),
+        new Promise<WeekendData>(res => setTimeout(() => res(weekendTimeout), 9000)),
+      ]),
     ]);
 
     // 2. Calculate EV for all assets using full spec formula
