@@ -469,8 +469,9 @@ function freshOptimize(
   const sc = [...constrs].sort((a,b) => (b.ev/b.price) - (a.ev/a.price));
   const n=sd.length, m=sc.length;
 
-  // Cheapest possible 2 constructors (for budget pruning)
-  const minC2 = sc.slice(-2).reduce((s,c)=>s+c.price, 0);
+  // Cheapest 2 constructors by PRICE (for budget pruning — NOT by EV/price ratio!)
+  // sc is sorted by EV/price so sc.slice(-2) gives WORST ratio, not cheapest price
+  const minC2 = [...constrs].sort((a,b)=>a.price-b.price).slice(0,2).reduce((s,c)=>s+c.price,0);
 
   let bestTeamEV   = -Infinity;
   let bestRemaining = Infinity;   // tie-break: lower = better (spent more)
