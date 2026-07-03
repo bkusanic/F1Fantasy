@@ -1330,6 +1330,20 @@ function ResultView({
                       : `🔵 ✓ ${prediction.dataStatus.weekendData} (noise: ${prediction.dataStatus.noiseLevel})`
                   }
                 </span>
+                <span
+                  onMouseEnter={e => prediction.dataStatus.oddsTopDrivers && setTooltip({
+                    x: e.clientX, y: e.clientY,
+                    content: `Favoriti po kladionicama:\n${prediction.dataStatus.oddsTopDrivers.split(" ").join("\n")}`
+                  })}
+                  onMouseLeave={() => setTooltip(null)}
+                  style={{
+                    color: prediction.dataStatus.odds?.startsWith("OK") ? "#4ADE80" : S.muted,
+                    cursor: prediction.dataStatus.oddsTopDrivers ? "pointer" : "default",
+                  }}>
+                  {prediction.dataStatus.odds?.startsWith("OK")
+                    ? `💰 ✓ Kvote (${prediction.dataStatus.odds.match(/\((\d+)/)?.[1] ?? "?"} kladionica)`
+                    : "💰 Kvote nedostupne"}
+                </span>
               </div>
             )}
           </div>

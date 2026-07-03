@@ -67,6 +67,120 @@ const OPENF1_CIRCUIT: Record<string, string[]> = {
   abu: ["Yas Marina", "Yas Marina Circuit"],
 };
 
+// ─── Betting odds — The Odds API (the-odds-api.com) ──────────────────────────
+// Market-implied win probabilities are the strongest public predictor.
+// Free tier: 500 credits/month. Odds cached 6h → ~8 credits per race weekend.
+
+const ODDS_LASTNAME_TO_CODE: Record<string, string> = {
+  norris:"NOR", piastri:"PIA", russell:"RUS", antonelli:"ANT",
+  leclerc:"LEC", hamilton:"HAM", verstappen:"VER", hadjar:"HAD",
+  albon:"ALB", sainz:"SAI", lawson:"LAW", lindblad:"LIN",
+  alonso:"ALO", stroll:"STR", ocon:"OCO", bearman:"BEA",
+  hulkenberg:"HUL", "hülkenberg":"HUL", bortoleto:"BOR",
+  gasly:"GAS", colapinto:"COL", perez:"PER", "pérez":"PER", bottas:"BOT",
+};
+
+interface OddsData {
+  winProb: Record<string, number>;   // devigged implied win probability per driver code
+  oddsEV: Record<string, number>;    // estimated fantasy pts from market ranking
+  bookmakerCount: number;
+  eventName: string;
+  available: boolean;
+}
+
+function nameToCode(fullName: string): string | null {
+  const parts = fullName.toLowerCase().trim().split(/\s+/);
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const code = ODDS_LASTNAME_TO_CODE[parts[i]];
+    if (code) return code;
+  }
+  return null;
+}
+
+async function getOdds(): Promise<OddsData> {
+  const empty: OddsData = { winProb:{}, oddsEV:{}, bookmakerCount:0, eventName:"", available:false };
+  const apiKey = process.env.ODDS_API_KEY;
+  if (!apiKey) return empty;
+
+  try {
+    // 1. Find the F1 sport key (the /sports call costs 0 credits)
+    const sportsRes = await fetchT(
+      `https://api.the-odds-api.com/v4/sports/?apiKey=${apiKey}&all=true`,
+      { next: { revalidate: 86400 } }, 5000);
+    if (!sportsRes.ok) return empty;
+    const sports: any[] = await sportsRes.json();
+    const f1 = sports.find(s =>
+      /formula[\s_]*1|formula[\s_]*one/i.test(s.key + " " + (s.title ?? "")));
+    if (!f1) return empty;
+
+    // 2. Fetch odds — outrights = race winner market for motorsport
+    const oddsRes = await fetchT(
+      `https://api.the-odds-api.com/v4/sports/${f1.key}/odds/?apiKey=${apiKey}&regions=eu&markets=outrights&oddsFormat=decimal`,
+      { next: { revalidate: 21600 } }, 6000);  // 6h cache
+    if (!oddsRes.ok) return empty;
+    const events: any[] = await oddsRes.json();
+    if (!events?.length) return empty;
+
+    // 3. Pick the next upcoming event (earliest commence_time in the future,
+    //    or the first one if all are in progress)
+    const now = Date.now();
+    const upcoming = events
+      .filter(e => new Date(e.commence_time).getTime() > now - 3*24*3600*1000)
+      .sort((a,b) => new Date(a.commence_time).getTime() - new Date(b.commence_time).getTime());
+    const event = upcoming[0] ?? events[0];
+    if (!event?.bookmakers?.length) return empty;
+
+    // 4. Average implied probability across all bookmakers per driver
+    const probSums: Record<string, {sum:number,n:number}> = {};
+    for (const bm of event.bookmakers) {
+      for (const market of bm.markets ?? []) {
+        if (market.key !== "outrights") continue;
+        for (const outcome of market.outcomes ?? []) {
+          const code = nameToCode(outcome.name ?? "");
+          if (!code || !outcome.price || outcome.price <= 1) continue;
+          const implied = 1 / outcome.price;
+          if (!probSums[code]) probSums[code] = {sum:0,n:0};
+          probSums[code].sum += implied;
+          probSums[code].n++;
+        }
+      }
+    }
+    const codes = Object.keys(probSums);
+    if (codes.length < 10) return empty;  // need most of the grid
+
+    // 5. Devig: normalize so probabilities sum to 1
+    const rawProbs: Record<string, number> = {};
+    let total = 0;
+    for (const code of codes) {
+      rawProbs[code] = probSums[code].sum / probSums[code].n;
+      total += rawProbs[code];
+    }
+    const winProb: Record<string, number> = {};
+    for (const code of codes) {
+      winProb[code] = parseFloat((rawProbs[code] / total).toFixed(4));
+    }
+
+    // 6. Convert market ranking → estimated fantasy points
+    //    Rank by win prob → estimated race finish → GP points + quali estimate
+    const GP_PTS: Record<number, number> = {1:25,2:18,3:15,4:12,5:10,6:8,7:6,8:4,9:2,10:1};
+    const ranked = codes.sort((a,b) => winProb[b] - winProb[a]);
+    const oddsEV: Record<string, number> = {};
+    ranked.forEach((code, idx) => {
+      const estPos = idx + 1;
+      const racePts = GP_PTS[estPos] ?? 0;
+      const qualiPts = Math.max(0, 11 - estPos);
+      oddsEV[code] = parseFloat((racePts + qualiPts).toFixed(1));
+    });
+
+    return {
+      winProb, oddsEV,
+      bookmakerCount: event.bookmakers.length,
+      eventName: event.sport_title ?? event.home_team ?? "",
+      available: true,
+    };
+  } catch { return empty; }
+}
+
 // ─── Driver & team baselines (2026 calibrated) ────────────────────────────────
 const DRIVER_BASELINE: Record<string, number> = {
   ANT:32, RUS:28, NOR:26, PIA:23, LEC:22, VER:20, HAM:19, SAI:15,
@@ -297,7 +411,8 @@ function calcEV(
   trackHist: Record<string, THistory>,
   weekend: WeekendData,
   trackId: string,
-  isSprint: boolean
+  isSprint: boolean,
+  odds: OddsData
 ): { ev: number; confidence: "HIGH"|"MEDIUM"|"LOW"; components: Record<string,number> } {
 
   const baseline = (DRIVER_BASELINE[code] ?? 8) * (TEAM_FACTOR[team] ?? 0.85);
@@ -326,6 +441,14 @@ function calcEV(
     baseEV = t * 0.70 + baseline * 0.30;
   } else {
     baseEV = baseline;
+  }
+
+  // ── Betting odds blend (market-implied expectations) ─────────────────────
+  // Odds aggregate all public information — strongest single predictor.
+  // Blend 35% odds / 65% our model when available.
+  const oddsEV = odds.available ? odds.oddsEV[code] : undefined;
+  if (oddsEV !== undefined) {
+    baseEV = baseEV * 0.65 + oddsEV * 0.35;
   }
 
   // ── Quali component: quali-sim pace predicts qualifying position ──────────
@@ -395,6 +518,7 @@ function calcEV(
     confidence,
     components: {
       baseEV: parseFloat(baseEV.toFixed(1)),
+      oddsEV: oddsEV !== undefined ? oddsEV : -1,
       qualiComponent: parseFloat(qualiComponent.toFixed(1)),
       raceComponent: parseFloat(raceComponent.toFixed(1)),
       overtakeUpside: parseFloat(overtakeUpside.toFixed(1)),
@@ -856,7 +980,8 @@ export async function POST(req: NextRequest) {
     };
 
     tick("START parallel fetch");
-    const [driverForm, trackResult, weekend] = await Promise.all([
+    const emptyOdds: OddsData = { winProb:{}, oddsEV:{}, bookmakerCount:0, eventName:"", available:false };
+    const [driverForm, trackResult, weekend, odds] = await Promise.all([
       Promise.race([
         getForm(2026),
         new Promise<Record<string,DForm>>(r=>setTimeout(()=>r(emptyForm), 6000)),
@@ -869,15 +994,19 @@ export async function POST(req: NextRequest) {
         getWeekendData(track.id, 2026),
         new Promise<WeekendData>(r=>setTimeout(()=>r(weekendFallback), 6000)),
       ]),
+      Promise.race([
+        getOdds(),
+        new Promise<OddsData>(r=>setTimeout(()=>r(emptyOdds), 6000)),
+      ]),
     ]);
     const {stats:trackStats, avgDnfRate} = trackResult;
-    tick(`fetch done: form=${Object.keys(driverForm).length} drivers, track=${Object.keys(trackStats).length}, weekend=${weekend.available}`);
+    tick(`fetch done: form=${Object.keys(driverForm).length}, track=${Object.keys(trackStats).length}, weekend=${weekend.available}, odds=${odds.available?odds.bookmakerCount+" bookies":"none"}`);
 
     // 2. EV calculation
     tick("START EV calc");
     const evMap: Record<string,{ev:number,confidence:"HIGH"|"MEDIUM"|"LOW",components:any}> = {};
     for (const [code,d] of Object.entries(allDriverData as Record<string,any>)) {
-      evMap[code] = calcEV(code,(d as any).team,driverForm,trackStats,weekend,track.id,track.isSprint);
+      evMap[code] = calcEV(code,(d as any).team,driverForm,trackStats,weekend,track.id,track.isSprint,odds);
     }
     for (const [id,c] of Object.entries(constructorData as Record<string,any>)) {
       const dCodes:string[]=(c as any).drivers??[];
@@ -993,6 +1122,11 @@ export async function POST(req: NextRequest) {
         weekendData: weekend.available?`${weekend.sessionsCompleted} sesija`:"UNAVAILABLE",
         gridAvailable: Object.keys(weekend.gridPositions).length>0,
         noiseLevel: weekend.noiseLevel,
+        odds: odds.available ? `OK (${odds.bookmakerCount} kladionica)` : "UNAVAILABLE",
+        oddsTopDrivers: odds.available
+          ? Object.entries(odds.winProb).sort((a,b)=>b[1]-a[1]).slice(0,5)
+              .map(([c,p])=>`${c}:${(p*100).toFixed(0)}%`).join(" ")
+          : "",
         transfersConsidered: optResult.considered??0,
         _log: log,
       },
