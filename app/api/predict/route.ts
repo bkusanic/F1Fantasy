@@ -78,6 +78,7 @@ const ODDS_LASTNAME_TO_CODE: Record<string, string> = {
   alonso:"ALO", stroll:"STR", ocon:"OCO", bearman:"BEA",
   hulkenberg:"HUL", "hülkenberg":"HUL", bortoleto:"BOR",
   gasly:"GAS", colapinto:"COL", perez:"PER", "pérez":"PER", bottas:"BOT",
+  tsunoda:"TSU",
 };
 
 interface OddsData {
@@ -184,9 +185,14 @@ async function getOdds(): Promise<OddsData> {
 // ─── Driver & team baselines (2026 calibrated) ────────────────────────────────
 const DRIVER_BASELINE: Record<string, number> = {
   ANT:32, RUS:28, NOR:26, PIA:23, LEC:22, VER:20, HAM:19, SAI:15,
-  ALB:13, HAD:12, LAW:11, BEA:11, ALO:9, OCO:9, GAS:8, HUL:8,
+  ALB:13, HAD:12, LAW:11, TSU:10, BEA:11, ALO:9, OCO:9, GAS:8, HUL:8,
   BOR:7, STR:7, COL:6, LIN:6, PER:4, BOT:4,
 };
+
+// ─── Vozači koji NE VOZE ovaj vikend (supstitucije, ozljede, kazne) ──────────
+// Ažuriraj ručno po potrebi — EV im pada na 0 pa ih optimizer nikad ne bira,
+// a transfer logika ih automatski predlaže za prodaju.
+const UNAVAILABLE_DRIVERS = new Set<string>(["HAD"]);  // R9: Hadjar out, mijenja ga Lawson
 const TEAM_FACTOR: Record<string, number> = {
   mercedes:1.0, mclaren:1.0, ferrari:0.98, redbull:0.95, williams:0.92,
   rb:0.88, aston:0.85, haas:0.85, audi:0.82, alpine:0.80, cadillac:0.65,
@@ -279,16 +285,18 @@ interface WeekendData {
   qualiSimScores:  Record<string, number>;  // 0-1, based on fastest lap (short run)
   longRunScores:   Record<string, number>;  // 0-1, based on consistent long stints
   gridPositions:   Record<string, number>;  // if qualifying already done
-  sessionsCompleted: number;                // 0-3 practice sessions seen
+  sessionsCompleted: number;                // practice sessions seen
+  expectedPractice: number;                 // 1 for sprint weekends, 3 otherwise
   sessionNames:    string[];
   noiseLevel:      "low"|"medium"|"high";  // how reliable is practice data
   available:       boolean;
 }
 
-async function getWeekendData(trackId: string, year: number): Promise<WeekendData> {
+async function getWeekendData(trackId: string, year: number, isSprint: boolean): Promise<WeekendData> {
+  const expectedPractice = isSprint ? 1 : 3;
   const empty: WeekendData = {
     qualiSimScores:{}, longRunScores:{}, gridPositions:{},
-    sessionsCompleted:0, sessionNames:[], noiseLevel:"high", available:false,
+    sessionsCompleted:0, expectedPractice, sessionNames:[], noiseLevel:"high", available:false,
   };
   try {
     const circuitNames = OPENF1_CIRCUIT[trackId] ?? [];
@@ -383,16 +391,20 @@ async function getWeekendData(trackId: string, year: number): Promise<WeekendDat
     }
 
     const sessionsCompleted = practiceCompleted.length;
+    // Sprint weekends have only 1 practice — a completed FP1 is "all the data there is".
+    // One session is inherently noisier than three, so sprint caps at "medium".
+    const hasGrid = Object.keys(gridPositions).length > 0;
     const noiseLevel: WeekendData["noiseLevel"] =
-      sessionsCompleted >= 3 ? "low" :
+      hasGrid ? "low" :
+      sessionsCompleted >= expectedPractice ? (isSprint ? "medium" : "low") :
       sessionsCompleted >= 2 ? "medium" : "high";
 
     return {
       qualiSimScores, longRunScores, gridPositions,
-      sessionsCompleted,
+      sessionsCompleted, expectedPractice,
       sessionNames: completed.map(s => s.session_name),
       noiseLevel,
-      available: sessionsCompleted > 0 || Object.keys(gridPositions).length > 0,
+      available: sessionsCompleted > 0 || hasGrid,
     };
   } catch { return empty; }
 }
@@ -414,6 +426,11 @@ function calcEV(
   isSprint: boolean,
   odds: OddsData
 ): { ev: number; confidence: "HIGH"|"MEDIUM"|"LOW"; components: Record<string,number> } {
+
+  // Driver not racing this weekend → EV 0, never selected, flagged for sale
+  if (UNAVAILABLE_DRIVERS.has(code)) {
+    return { ev: 0, confidence: "HIGH", components: { unavailable: 1 } };
+  }
 
   const baseline = (DRIVER_BASELINE[code] ?? 8) * (TEAM_FACTOR[team] ?? 0.85);
   const f = form[code]?.avgPts;
@@ -905,13 +922,17 @@ function pipelineOptimize(
     };
   });
 
-  // Sessions remaining warning
-  const remainingSessions = 3 - weekend.sessionsCompleted;
+  // Sessions remaining warning (sprint-aware: sprint weekends have only 1 practice)
+  const expected = weekend.expectedPractice ?? 3;
+  const remainingSessions = Math.max(0, expected - weekend.sessionsCompleted);
   const sessionsWarning = remainingSessions > 0
     ? `Preostaje ${remainingSessions} trening ${remainingSessions===1?"sesija":"sesije"} prije qualifyinga — ` +
       `procjene su ${weekend.noiseLevel==="high"?"niske":"srednje"} pouzdanosti. ` +
       `Potvrdi prijedlog nakon zadnjeg treninga.`
-    : null;
+    : (expected === 1 && weekend.sessionsCompleted >= 1 && Object.keys(weekend.gridPositions).length === 0)
+      ? `Sprint vikend — jedini trening (FP1) je odvožen i uključen u procjenu. ` +
+        `Točnost raste nakon Sprint Qualifyinga.`
+      : null;
 
   return {
     transfers, recommendedBoost, boostChanged, weakLinks,
@@ -976,7 +997,8 @@ export async function POST(req: NextRequest) {
     const emptyTrack = { stats: {} as Record<string,THistory>, avgDnfRate: 0.08 };
     const weekendFallback: WeekendData = {
       qualiSimScores:{}, longRunScores:{}, gridPositions:{},
-      sessionsCompleted:0, sessionNames:[], noiseLevel:"high", available:false,
+      sessionsCompleted:0, expectedPractice: track.isSprint ? 1 : 3,
+      sessionNames:[], noiseLevel:"high", available:false,
     };
 
     tick("START parallel fetch");
@@ -991,7 +1013,7 @@ export async function POST(req: NextRequest) {
         new Promise<typeof emptyTrack>(r=>setTimeout(()=>r(emptyTrack), 6000)),
       ]),
       Promise.race([
-        getWeekendData(track.id, 2026),
+        getWeekendData(track.id, 2026, !!track.isSprint),
         new Promise<WeekendData>(r=>setTimeout(()=>r(weekendFallback), 6000)),
       ]),
       Promise.race([
