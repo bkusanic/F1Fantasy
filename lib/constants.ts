@@ -2,60 +2,60 @@ import type { Driver, Constructor, Track } from "./types";
 
 // ─── 2026 Driver Roster ───────────────────────────────────────────────────────
 // ⚠️  CIJENE SE MIJENJAJU SVAKI TJEDAN — ažuriraj iz F1 Fantasy app prije svake utrke!
-// Zadnje ažuriranje: R9 British GP 2026 (na temelju screenshota korisnika)
+// Zadnje ažuriranje: 21. 08. 2026. (admin)
 
 export const DRIVERS_2025: Driver[] = [
   // McLaren
-  { id: "nor", name: "Lando Norris",      shortName: "NOR", team: "mclaren",   price: 32.0, driverNumber: 1  },
-  { id: "pia", name: "Oscar Piastri",     shortName: "PIA", team: "mclaren",   price: 27.5, driverNumber: 81 },
+  { id: "nor", name: "Lando Norris",      shortName: "NOR", team: "mclaren",   price: 26.1, driverNumber: 1  },
+  { id: "pia", name: "Oscar Piastri",     shortName: "PIA", team: "mclaren",   price: 24.4, driverNumber: 81 },
   // Mercedes
-  { id: "rus", name: "George Russell",    shortName: "RUS", team: "mercedes",  price: 29.0, driverNumber: 63 },
-  { id: "ant", name: "Kimi Antonelli",    shortName: "ANT", team: "mercedes",  price: 26.0, driverNumber: 12 },
+  { id: "rus", name: "George Russell",    shortName: "RUS", team: "mercedes",  price: 27.9, driverNumber: 63 },
+  { id: "ant", name: "Kimi Antonelli",    shortName: "ANT", team: "mercedes",  price: 25.7, driverNumber: 12 },
   // Ferrari
-  { id: "lec", name: "Charles Leclerc",   shortName: "LEC", team: "ferrari",   price: 25.0, driverNumber: 16 },
-  { id: "ham", name: "Lewis Hamilton",    shortName: "HAM", team: "ferrari",   price: 24.5, driverNumber: 44 }, // ↑ was 22.0
+  { id: "lec", name: "Charles Leclerc",   shortName: "LEC", team: "ferrari",   price: 23.9, driverNumber: 16 },
+  { id: "ham", name: "Lewis Hamilton",    shortName: "HAM", team: "ferrari",   price: 25.0, driverNumber: 44 }, // ↑ was 22.0
   // Red Bull
-  { id: "ver", name: "Max Verstappen",    shortName: "VER", team: "redbull",   price: 24.0, driverNumber: 33 },
-  { id: "had", name: "Isack Hadjar",      shortName: "HAD", team: "redbull",   price: 12.5, driverNumber: 6  }, // R9: NE VOZI (EV=0)
+  { id: "ver", name: "Max Verstappen",    shortName: "VER", team: "redbull",   price: 27.6, driverNumber: 33 },
+  { id: "had", name: "Isack Hadjar",      shortName: "HAD", team: "redbull",   price: 10.0, driverNumber: 6  }, // R9: NE VOZI (EV=0)
   // Williams
-  { id: "alb", name: "Alex Albon",        shortName: "ALB", team: "williams",  price: 11.0, driverNumber: 23 },
-  { id: "sai", name: "Carlos Sainz",      shortName: "SAI", team: "williams",  price: 14.5, driverNumber: 55 },
+  { id: "alb", name: "Alex Albon",        shortName: "ALB", team: "williams",  price: 5.8, driverNumber: 23 },
+  { id: "sai", name: "Carlos Sainz",      shortName: "SAI", team: "williams",  price: 10.0, driverNumber: 55 },
   // Racing Bulls
-  { id: "law", name: "Liam Lawson",       shortName: "LAW", team: "redbull",   price: 9.5,  driverNumber: 30 }, // R9: mijenja Hadjara u Red Bullu
-  { id: "lin", name: "Arvid Lindblad",    shortName: "LIN", team: "rb",        price: 6.2,  driverNumber: 41 },
-  { id: "tsu", name: "Yuki Tsunoda",      shortName: "TSU", team: "rb",        price: 7.0,  driverNumber: 22 }, // R9: mijenja Lawsona — PROVJERI CIJENU u builderu!
+  { id: "law", name: "Liam Lawson",       shortName: "LAW", team: "redbull",   price: 14.5,  driverNumber: 30 }, // R9: mijenja Hadjara u Red Bullu
+  { id: "lin", name: "Arvid Lindblad",    shortName: "LIN", team: "rb",        price: 8.0,  driverNumber: 41 },
+  { id: "tsu", name: "Yuki Tsunoda",      shortName: "TSU", team: "rb",        price: 10.3,  driverNumber: 22 }, // R9: mijenja Lawsona — PROVJERI CIJENU u builderu!
   // Aston Martin
-  { id: "alo", name: "Fernando Alonso",   shortName: "ALO", team: "aston",     price: 9.0,  driverNumber: 14 },
-  { id: "str", name: "Lance Stroll",      shortName: "STR", team: "aston",     price: 3.6,  driverNumber: 18 }, // ↓ was 7.5
+  { id: "alo", name: "Fernando Alonso",   shortName: "ALO", team: "aston",     price: 6.2,  driverNumber: 14 },
+  { id: "str", name: "Lance Stroll",      shortName: "STR", team: "aston",     price: 3.0,  driverNumber: 18 }, // ↓ was 7.5
   // Haas
-  { id: "oco", name: "Esteban Ocon",      shortName: "OCO", team: "haas",      price: 10.1, driverNumber: 31 }, // ↑ was 8.0
-  { id: "bea", name: "Oliver Bearman",    shortName: "BEA", team: "haas",      price: 8.5,  driverNumber: 87 },
+  { id: "oco", name: "Esteban Ocon",      shortName: "OCO", team: "haas",      price: 10.7, driverNumber: 31 }, // ↑ was 8.0
+  { id: "bea", name: "Oliver Bearman",    shortName: "BEA", team: "haas",      price: 7.6,  driverNumber: 87 },
   // Audi (ex-Sauber)
-  { id: "hul", name: "Nico Hülkenberg",   shortName: "HUL", team: "audi",      price: 8.0,  driverNumber: 27 },
-  { id: "bor", name: "Gabriel Bortoleto", shortName: "BOR", team: "audi",      price: 9.0,  driverNumber: 5  },
+  { id: "hul", name: "Nico Hülkenberg",   shortName: "HUL", team: "audi",      price: 3.0,  driverNumber: 27 },
+  { id: "bor", name: "Gabriel Bortoleto", shortName: "BOR", team: "audi",      price: 7.8,  driverNumber: 5  },
   // Alpine
-  { id: "gas", name: "Pierre Gasly",      shortName: "GAS", team: "alpine",    price: 8.5,  driverNumber: 10 },
-  { id: "col", name: "Franco Colapinto",  shortName: "COL", team: "alpine",    price: 9.8,  driverNumber: 43 }, // ↑ was 7.0
+  { id: "gas", name: "Pierre Gasly",      shortName: "GAS", team: "alpine",    price: 13.0,  driverNumber: 10 },
+  { id: "col", name: "Franco Colapinto",  shortName: "COL", team: "alpine",    price: 11.2,  driverNumber: 43 }, // ↑ was 7.0
   // Cadillac (new team)
-  { id: "per", name: "Sergio Pérez",      shortName: "PER", team: "cadillac",  price: 8.0,  driverNumber: 11 },
-  { id: "bot", name: "Valtteri Bottas",   shortName: "BOT", team: "cadillac",  price: 6.5,  driverNumber: 77 },
+  { id: "per", name: "Sergio Pérez",      shortName: "PER", team: "cadillac",  price: 3.8,  driverNumber: 11 },
+  { id: "bot", name: "Valtteri Bottas",   shortName: "BOT", team: "cadillac",  price: 3.0,  driverNumber: 77 },
 ];
 
 // ─── 2026 Constructors ────────────────────────────────────────────────────────
 // ⚠️  Ažuriraj cijene tjedni iz F1 Fantasy app!
 
 export const CONSTRUCTORS_2025: Constructor[] = [
-  { id: "mclaren",  name: "McLaren",       shortName: "MCL", price: 34.0, drivers: ["nor", "pia"] },
-  { id: "mercedes", name: "Mercedes",      shortName: "MER", price: 30.0, drivers: ["rus", "ant"] },
-  { id: "ferrari",  name: "Ferrari",       shortName: "FER", price: 26.5, drivers: ["lec", "ham"] },
-  { id: "redbull",  name: "Red Bull",      shortName: "RBR", price: 30.0, drivers: ["ver", "law"] }, // R9: LAW umjesto HAD
-  { id: "williams", name: "Williams",      shortName: "WIL", price: 13.5, drivers: ["alb", "sai"] },
-  { id: "rb",       name: "Racing Bulls",  shortName: "RB",  price: 9.0,  drivers: ["tsu", "lin"] }, // R9: TSU umjesto LAW
-  { id: "aston",    name: "Aston Martin",  shortName: "AMR", price: 8.5,  drivers: ["alo", "str"] },
-  { id: "haas",     name: "Haas",          shortName: "HAA", price: 9.5,  drivers: ["oco", "bea"] },
-  { id: "audi",     name: "Audi",          shortName: "AUD", price: 8.0,  drivers: ["hul", "bor"] },
-  { id: "alpine",   name: "Alpine",        shortName: "ALP", price: 7.5,  drivers: ["gas", "col"] },
-  { id: "cadillac", name: "Cadillac",      shortName: "CAD", price: 5.5,  drivers: ["per", "bot"] },
+  { id: "mclaren",  name: "McLaren",       shortName: "MCL", price: 31.0, drivers: ["nor", "pia"] },
+  { id: "mercedes", name: "Mercedes",      shortName: "MER", price: 32.6, drivers: ["rus", "ant"] },
+  { id: "ferrari",  name: "Ferrari",       shortName: "FER", price: 26.6, drivers: ["lec", "ham"] },
+  { id: "redbull",  name: "Red Bull",      shortName: "RBR", price: 30.9, drivers: ["ver", "law"] }, // R9: LAW umjesto HAD
+  { id: "williams", name: "Williams",      shortName: "WIL", price: 13.0, drivers: ["alb", "sai"] },
+  { id: "rb",       name: "Racing Bulls",  shortName: "RB",  price: 12.9,  drivers: ["tsu", "lin"] }, // R9: TSU umjesto LAW
+  { id: "aston",    name: "Aston Martin",  shortName: "AMR", price: 5.7,  drivers: ["alo", "str"] },
+  { id: "haas",     name: "Haas",          shortName: "HAA", price: 12.0,  drivers: ["oco", "bea"] },
+  { id: "audi",     name: "Audi",          shortName: "AUD", price: 6.8,  drivers: ["hul", "bor"] },
+  { id: "alpine",   name: "Alpine",        shortName: "ALP", price: 18.8,  drivers: ["gas", "col"] },
+  { id: "cadillac", name: "Cadillac",      shortName: "CAD", price: 3.0,  drivers: ["per", "bot"] },
 ];
 
 // ─── 2026 Race Calendar (22 races — Bahrain & Saudi otkazani) ─────────────────
