@@ -1280,10 +1280,13 @@ function ResultView({
                 <>
                   <span style={{ fontSize: 16 }}>{bestChip.icon}</span>
                   <span style={{ fontSize: 14, fontWeight: 900,
-                    color: bestChip.label === "PREPORUČENO" ? "#5AB4FF" : S.gold }}>
+                    color: bestChip.label === "PREPORUČENO" ? "#5AB4FF"
+                         : bestChip.label === "DOBRO" ? "#4ADE80" : S.gold }}>
                     {bestChip.label === "PREPORUČENO"
-                      ? bestChip.chip.replace("_", " ").toUpperCase()
-                      : `SAČUVAJ (${bestChip.chip.replace("_"," ")})`}
+                      ? `✅ KORISTI: ${bestChip.chip.replace("_", " ").toUpperCase()}`
+                      : bestChip.label === "DOBRO"
+                        ? `💡 RAZMOTRI: ${bestChip.chip.replace("_", " ").toUpperCase()}`
+                        : `SAČUVAJ (${bestChip.chip.replace("_"," ")})`}
                   </span>
                   <div
                     onMouseEnter={e => setTooltip({ x: e.clientX, y: e.clientY, content: bestChip.reason })}

@@ -27,7 +27,7 @@ const TRACK_OVERTAKING: Record<string, number> = {
 };
 /** Extra incident/DNF risk modifier per track */
 const TRACK_INCIDENT_RISK: Record<string, number> = {
-  mon: 0.35, aze: 0.25, sgp: 0.20, aus: 0.15, lvg: 0.12,
+  mon: 0.35, mad: 0.30, aze: 0.25, sgp: 0.20, aus: 0.15, lvg: 0.12,
   bra: 0.10, gbr: 0.08, can: 0.08, bel: 0.05,
 };
 
@@ -56,7 +56,7 @@ const OPENF1_CIRCUIT: Record<string, string[]> = {
   hun: ["Hungaroring", "Budapest"],
   nld: ["Zandvoort", "Circuit Zandvoort"],
   ita: ["Monza", "Autodromo Nazionale Monza"],
-  mad: ["Madrid", "Circuit Madrid"],
+  mad: ["Madring", "Madrid", "IFEMA", "Circuito de Madring"],
   aze: ["Baku", "Baku City Circuit"],
   sgp: ["Marina Bay", "Marina Bay Street Circuit"],
   usc: ["Circuit of The Americas", "COTA", "Austin"],
@@ -922,17 +922,21 @@ function pipelineOptimize(
     };
   });
 
-  // Sessions remaining warning (sprint-aware: sprint weekends have only 1 practice)
+  // Sessions warning: distinguish "data unavailable" from "sessions genuinely remaining".
+  // Without this, a track OpenF1 doesn't cover shows "3 sessions remaining" forever.
   const expected = weekend.expectedPractice ?? 3;
   const remainingSessions = Math.max(0, expected - weekend.sessionsCompleted);
-  const sessionsWarning = remainingSessions > 0
-    ? `Preostaje ${remainingSessions} trening ${remainingSessions===1?"sesija":"sesije"} prije qualifyinga — ` +
-      `procjene su ${weekend.noiseLevel==="high"?"niske":"srednje"} pouzdanosti. ` +
-      `Potvrdi prijedlog nakon zadnjeg treninga.`
-    : (expected === 1 && weekend.sessionsCompleted >= 1 && Object.keys(weekend.gridPositions).length === 0)
-      ? `Sprint vikend — jedini trening (FP1) je odvožen i uključen u procjenu. ` +
-        `Točnost raste nakon Sprint Qualifyinga.`
-      : null;
+  const sessionsWarning = !weekend.available
+    ? `Trening podaci nedostupni za ovu stazu (OpenF1) — procjena se temelji na kvotama, formi i historiji. ` +
+      `Broj odvoženih treninga nije poznat.`
+    : remainingSessions > 0
+      ? `Preostaje ${remainingSessions} trening ${remainingSessions===1?"sesija":"sesije"} prije qualifyinga — ` +
+        `procjene su ${weekend.noiseLevel==="high"?"niske":"srednje"} pouzdanosti. ` +
+        `Potvrdi prijedlog nakon zadnjeg treninga.`
+      : (expected === 1 && Object.keys(weekend.gridPositions).length === 0)
+        ? `Sprint vikend — jedini trening (FP1) je odvožen i uključen u procjenu. ` +
+          `Točnost raste nakon Sprint Qualifyinga.`
+        : null;
 
   return {
     transfers, recommendedBoost, boostChanged, weakLinks,
@@ -947,17 +951,24 @@ const CHIP_ICONS: Record<string,string> = {
 };
 interface ChipScore{chip:string;icon:string;score:number;label:"PREPORUČENO"|"DOBRO"|"SAČUVAJ";reason:string}
 
-function scoreChips(chips:string[],track:{isSprint:boolean;circuitType:string;round:number},
-  totalRounds:number,avgDnfRate:number,pred:number):ChipScore[]{
+function scoreChips(chips:string[],track:{isSprint:boolean;circuitType:string;round:number;id?:string},
+  totalRounds:number,avgDnfRate:number,pred:number,isNewTrack:boolean=false):ChipScore[]{
+  // New track (no Jolpica history): risk is UNKNOWN, not low.
+  // Default avgDnfRate (0.08) would understate it — assume elevated risk instead.
+  const effDnf = isNewTrack ? Math.max(avgDnfRate, 0.18) : avgDnfRate;
+  const trackRisk = TRACK_INCIDENT_RISK[track.id ?? ""] ?? 0;
   return chips.map(chip=>{
     let score=0,reason="";
     switch(chip){
-      case"limitless":score=Math.round(pred*55+(track.isSprint?30:5));
-        reason=track.isSprint?"Sprint + predvidiva staza — idealno za Limitless."
+      case"limitless":score=Math.round(pred*55+(track.isSprint?30:5)-(isNewTrack?15:0));
+        reason=isNewTrack?"Nova staza — previše nepoznanica za Limitless, sačuvaj."
+          :track.isSprint?"Sprint + predvidiva staza — idealno za Limitless."
           :pred>0.65?`Predvidiva (${Math.round(pred*100)}%) — dobar timing.`:"Sačuvaj za Monza/Bahrain.";break;
-      case"no_negative":score=Math.min(100,Math.round(avgDnfRate*180+(track.circuitType==="street"?32:0)));
-        reason=track.circuitType==="street"?`Street — visok DNF (${Math.round(avgDnfRate*100)}%). Idealan.`
-          :avgDnfRate>0.15?`DNF rate ${Math.round(avgDnfRate*100)}%.`:"Bolje za street ili mokru utrku.";break;
+      case"no_negative":score=Math.min(100,Math.round(
+          effDnf*180+(track.circuitType==="street"?32:0)+(isNewTrack?20:0)+trackRisk*40));
+        reason=isNewTrack?"Nova staza bez podataka + street layout — rizik incidenata visok. Idealan vikend za No Negative."
+          :track.circuitType==="street"?`Street — visok DNF (${Math.round(effDnf*100)}%). Idealan.`
+          :effDnf>0.15?`DNF rate ${Math.round(effDnf*100)}%.`:"Bolje za street ili mokru utrku.";break;
       case"extra_drs":score=track.isSprint?88:Math.round(45+pred*25);
         reason=track.isSprint?"Sprint: Extra DRS=3×. Maksimalan EV.":"Stavi na dominantnog vozača.";break;
       case"autopilot":score=track.isSprint?72:Math.round(20+(1-pred)*35);
@@ -1042,7 +1053,8 @@ export async function POST(req: NextRequest) {
 
     // 3. Optimize
     const pred = Math.max(0,Math.min(1,1-avgDnfRate*2.5-(track.circuitType==="street"?0.2:0)));
-    const chipScores = scoreChips(availableChips, track, 22, avgDnfRate, pred);
+    const isNewTrack = Object.keys(trackStats).length === 0;
+    const chipScores = scoreChips(availableChips, track, 22, avgDnfRate, pred, isNewTrack);
     let optResult: any = {};
     let noTransferScore = 0;
 
