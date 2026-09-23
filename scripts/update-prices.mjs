@@ -1,133 +1,63 @@
 // scripts/update-prices.mjs
-// Automatsko ažuriranje cijena iz F1 Fantasy javnog API-ja (bez logina).
-// Pokreće ga GitHub Actions svaki četvrtak (+ ručno preko workflow_dispatch).
+// Automatsko ažuriranje cijena iz javnog F1 Fantasy feeda (bez logina).
+// Feed: https://fantasy.formula1.com/feeds/drivers/{GAMEDAY}_en.json
+//   - GAMEDAY = redni broj utrke; uzimamo NAJVIŠI koji postoji (= aktualne cijene)
+//   - Data.Value[]: vozači (PositionName "DRIVER") i konstruktori ("CONSTRUCTOR")
+//   - cijena = Value, kod = DriverTLA
 // Sigurnosni princip: radije NE napraviti ništa nego upisati krive cijene.
 
 import { readFileSync, writeFileSync } from "node:fs";
 
-const YEAR = new Date().getFullYear();
 const CONSTANTS_PATH = "lib/constants.ts";
+const FEED = n => `https://fantasy.formula1.com/feeds/drivers/${n}_en.json`;
+const MAX_GAMEDAY = 30;
 
-// ── Kandidat-endpointi (F1 povremeno mijenja platformu — probamo redom) ──────
-const DRIVER_ENDPOINTS = [
-  `https://fantasy-api.formula1.com/f1/${YEAR}/players`,
-  `https://fantasy-api.formula1.com/partner_games/f1/players`,
-  `https://fantasy.formula1.com/feeds/drivers/1_en.json`,
-];
-const TEAM_ENDPOINTS = [
-  `https://fantasy-api.formula1.com/f1/${YEAR}/teams`,
-  `https://fantasy-api.formula1.com/partner_games/f1/teams`,
-  `https://fantasy.formula1.com/feeds/constructors/1_en.json`,
-];
-
-// ── Mapiranja imena → naši kodovi ────────────────────────────────────────────
-const LASTNAME_TO_CODE = {
-  norris:"NOR", piastri:"PIA", russell:"RUS", antonelli:"ANT",
-  leclerc:"LEC", hamilton:"HAM", verstappen:"VER", hadjar:"HAD",
-  albon:"ALB", sainz:"SAI", lawson:"LAW", lindblad:"LIN",
-  alonso:"ALO", stroll:"STR", ocon:"OCO", bearman:"BEA",
-  hulkenberg:"HUL", "hülkenberg":"HUL", bortoleto:"BOR",
-  gasly:"GAS", colapinto:"COL", perez:"PER", "pérez":"PER",
-  bottas:"BOT", tsunoda:"TSU",
+// Konstruktor TLA iz feeda → naš id
+const CONSTR_TLA = {
+  MER:"mercedes", MCL:"mclaren", RBR:"redbull", FER:"ferrari", ALP:"alpine",
+  WIL:"williams", AST:"aston", AMR:"aston", HAA:"haas", AUD:"audi",
+  RBS:"rb", VRB:"rb", CAD:"cadillac",
 };
-const TEAMNAME_TO_ID = [
-  [/mclaren/i, "mclaren"], [/mercedes/i, "mercedes"], [/ferrari/i, "ferrari"],
-  [/red\s*bull(?!s)/i, "redbull"], [/williams/i, "williams"],
-  [/racing\s*bulls|^rb\b|visa|vcarb/i, "rb"], [/aston/i, "aston"],
-  [/haas/i, "haas"], [/audi|sauber|kick/i, "audi"], [/alpine/i, "alpine"],
-  [/cadillac/i, "cadillac"],
-];
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-async function tryFetch(urls) {
-  for (const url of urls) {
-    try {
-      const res = await fetch(url, {
-        headers: { "Accept": "application/json", "User-Agent": "Mozilla/5.0 (price-sync)" },
-        signal: AbortSignal.timeout(15000),
-      });
-      if (!res.ok) { console.log(`  ${url} → HTTP ${res.status}`); continue; }
-      const data = await res.json();
-      console.log(`  ${url} → OK`);
-      return data;
-    } catch (e) { console.log(`  ${url} → ${e.message}`); }
-  }
-  return null;
+async function fetchFeed(n) {
+  try {
+    const res = await fetch(FEED(n), {
+      headers: { "Accept": "application/json", "User-Agent": "Mozilla/5.0 (price-sync)" },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) return { status: res.status };
+    const json = await res.json();
+    const list = json?.Data?.Value;
+    return Array.isArray(list) && list.length ? { status: 200, list, feedTime: json?.Data?.FeedTime?.UTCTime } : { status: "empty" };
+  } catch (e) { return { status: e.message }; }
 }
 
-// Izvuci listu objekata iz raznih omotača ({players:[...]}, {data:[...]}, [...])
-function extractList(data) {
-  if (Array.isArray(data)) return data;
-  for (const key of ["players", "drivers", "teams", "constructors", "data", "results"]) {
-    if (Array.isArray(data?.[key])) return data[key];
-  }
-  return null;
-}
-
-// Cijena se kroz sezone zvala raznim imenima
-function extractPrice(obj) {
-  for (const key of ["price", "curr_price", "current_price", "cost", "now_cost", "player_value", "value"]) {
-    const v = parseFloat(obj?.[key]);
-    if (!isNaN(v) && v > 0) return v;
-  }
-  return null;
-}
-function extractName(obj) {
-  return obj?.last_name ?? obj?.lastName ?? obj?.display_name ?? obj?.name ?? obj?.full_name ?? "";
-}
-
-function updateLine(content, marker, matchKey, newPrice) {
-  const lines = content.split("\n");
-  let hit = false;
-  const out = lines.map(line => {
-    if (!line.includes(marker) || !line.includes(matchKey)) return line;
-    hit = true;
-    return line.replace(/price:\s*[\d.]+/, `price: ${newPrice.toFixed(1)}`);
-  }).join("\n");
-  return { out, hit };
-}
-
-// ── Main ─────────────────────────────────────────────────────────────────────
+// ── 1. Pronađi najnoviji gameday feed ────────────────────────────────────────
 console.log("=== F1 Fantasy price sync ===");
-console.log("Dohvaćam vozače...");
-const driversRaw = extractList(await tryFetch(DRIVER_ENDPOINTS));
-console.log("Dohvaćam konstruktore...");
-const teamsRaw = extractList(await tryFetch(TEAM_ENDPOINTS));
+let latest = null, misses = 0;
+for (let n = 1; n <= MAX_GAMEDAY; n++) {
+  const r = await fetchFeed(n);
+  if (r.status === 200) { latest = { n, ...r }; misses = 0; }
+  else if (latest && ++misses >= 2) break;   // 2 uzastopna promašaja nakon zadnjeg valjanog → kraj
+}
+if (!latest) { console.error("FAIL: nijedan gameday feed nije dostupan. Cijene NISU mijenjane."); process.exit(1); }
+console.log(`Najnoviji feed: gameday ${latest.n} (FeedTime UTC: ${latest.feedTime ?? "?"}) — ${FEED(latest.n)}`);
 
-if (!driversRaw?.length) { console.error("FAIL: nijedan driver endpoint nije vratio podatke. Cijene NISU mijenjane."); process.exit(1); }
-
-// Mapiranje vozača
-const driverPrices = {};  // shortName → price
-for (const p of driversRaw) {
-  const name = String(extractName(p)).toLowerCase();
-  const price = extractPrice(p);
-  if (!price) continue;
-  for (const [lastname, code] of Object.entries(LASTNAME_TO_CODE)) {
-    if (name.includes(lastname)) { driverPrices[code] = price; break; }
+// ── 2. Parsiranje ────────────────────────────────────────────────────────────
+const driverPrices = {}, teamPrices = {}, unknown = [];
+for (const p of latest.list) {
+  const tla = String(p?.DriverTLA ?? "").toUpperCase();
+  const price = parseFloat(p?.Value);
+  if (!tla || isNaN(price)) continue;
+  if (p?.PositionName === "DRIVER") driverPrices[tla] = price;
+  else if (p?.PositionName === "CONSTRUCTOR") {
+    const id = CONSTR_TLA[tla];
+    if (id) teamPrices[id] = price; else unknown.push(`konstruktor ${tla} (${p?.FUllName})`);
   }
 }
-console.log(`Mapirano vozača: ${Object.keys(driverPrices).length}`, driverPrices);
+console.log(`Iz feeda: ${Object.keys(driverPrices).length} vozača, ${Object.keys(teamPrices).length} konstruktora`);
 
-// Mapiranje konstruktora (mogu biti u istom feedu kao vozači — position/type polje — ili zasebnom)
-const teamPrices = {};    // id → price
-const teamSource = teamsRaw?.length ? teamsRaw : driversRaw;
-for (const t of teamSource) {
-  const name = String(extractName(t)).toLowerCase();
-  const price = extractPrice(t);
-  if (!price) continue;
-  const isConstructor = t?.is_constructor === true ||
-    String(t?.position ?? t?.type ?? "").toLowerCase().includes("constructor") ||
-    (teamsRaw?.length && teamSource === teamsRaw);
-  if (!isConstructor) continue;
-  for (const [re, id] of TEAMNAME_TO_ID) {
-    if (re.test(name)) { teamPrices[id] = price; break; }
-  }
-}
-console.log(`Mapirano konstruktora: ${Object.keys(teamPrices).length}`, teamPrices);
-
-// ── Sanity guard: bolje ništa nego krivo ─────────────────────────────────────
-// Očekivani popis se izvodi iz samog constants.ts (single source of truth za rostere),
-// a vozači iz UNAVAILABLE_DRIVERS (route.ts) smiju nedostajati u API-ju.
+// ── 3. Sanity guard ──────────────────────────────────────────────────────────
 const constantsSrc = readFileSync(CONSTANTS_PATH, "utf-8").split("\n");
 const expectedDrivers = constantsSrc.filter(l => l.includes("driverNumber"))
   .map(l => l.match(/shortName:\s*"([A-Z]+)"/)?.[1]).filter(Boolean);
@@ -136,54 +66,46 @@ const expectedTeams = constantsSrc.filter(l => l.includes("drivers: ["))
 
 let unavailable = [];
 try {
-  const routeSrc = readFileSync("app/api/predict/route.ts", "utf-8");
-  const m = routeSrc.match(/UNAVAILABLE_DRIVERS\s*=\s*new Set<string>\(\[([^\]]*)\]\)/);
+  const m = readFileSync("app/api/predict/route.ts", "utf-8")
+    .match(/UNAVAILABLE_DRIVERS\s*=\s*new Set<string>\(\[([^\]]*)\]\)/);
   unavailable = m ? [...m[1].matchAll(/"([A-Z]+)"/g)].map(x => x[1]) : [];
 } catch {}
 
+console.log(`Očekivano: ${expectedDrivers.length} vozača (smiju nedostajati: ${unavailable.join(",") || "—"}), ${expectedTeams.length} konstruktora`);
+
+for (const tla of Object.keys(driverPrices))
+  if (!expectedDrivers.includes(tla)) unknown.push(`vozač ${tla}`);
+
 const missingDrivers = expectedDrivers.filter(c => !(c in driverPrices) && !unavailable.includes(c));
 const missingTeams   = expectedTeams.filter(id => !(id in teamPrices));
-const allPrices = [...Object.values(driverPrices), ...Object.values(teamPrices)];
-const outOfRange = allPrices.filter(p => p < 1 || p > 45);
-
-console.log(`Očekivano: ${expectedDrivers.length} vozača (dopušteno nedostaje: ${unavailable.join(",") || "—"}), ${expectedTeams.length} konstruktora`);
+const outOfRange = [...Object.values(driverPrices), ...Object.values(teamPrices)].filter(p => p < 1 || p > 45);
 
 const errors = [];
-if (missingDrivers.length) errors.push(`vozači bez cijene iz API-ja: ${missingDrivers.join(", ")}`);
-if (missingTeams.length)   errors.push(`konstruktori bez cijene iz API-ja: ${missingTeams.join(", ")}`);
+if (missingDrivers.length) errors.push(`vozači bez cijene u feedu: ${missingDrivers.join(", ")}`);
+if (missingTeams.length)   errors.push(`konstruktori bez cijene u feedu: ${missingTeams.join(", ")}`);
 if (outOfRange.length)     errors.push(`cijene izvan raspona 1-45: ${outOfRange.join(", ")}`);
-if (errors.length) {
-  console.error(`FAIL — cijene NISU mijenjane:\n  - ${errors.join("\n  - ")}`);
-  process.exit(1);
-}
+if (errors.length) { console.error(`FAIL — cijene NISU mijenjane:\n  - ${errors.join("\n  - ")}`); process.exit(1); }
+if (unknown.length) console.log(`::warning::Feed sadrži unose kojih nema u rosteru (nova supstitucija?): ${unknown.join(", ")}`);
 
-// Upozorenje (ne fail): API ima vozača kojeg nemamo u rosteru → vjerojatno nova supstitucija
-const unknown = driversRaw
-  .filter(p => extractPrice(p))
-  .map(p => String(extractName(p)))
-  .filter(n => !Object.keys(LASTNAME_TO_CODE).some(ln => n.toLowerCase().includes(ln)));
-if (unknown.length) console.log(`::warning::API sadrži vozače kojih nema u rosteru (nova supstitucija?): ${unknown.join(", ")}`);
-
-// ── Upis u constants.ts ──────────────────────────────────────────────────────
+// ── 4. Upis u constants.ts ───────────────────────────────────────────────────
 let content = readFileSync(CONSTANTS_PATH, "utf-8");
 const before = content;
-let changed = 0, missed = [];
+const changes = [];
 
-for (const [code, price] of Object.entries(driverPrices)) {
-  const { out, hit } = updateLine(content, "driverNumber", `shortName: "${code}"`, price);
-  if (hit) { if (out !== content) changed++; content = out; } else missed.push(code);
-}
-for (const [id, price] of Object.entries(teamPrices)) {
-  const { out, hit } = updateLine(content, "drivers: [", `id: "${id}"`, price);
-  if (hit) { if (out !== content) changed++; content = out; } else missed.push(id);
-}
+content = content.split("\n").map(line => {
+  const d = line.includes("driverNumber") && line.match(/shortName:\s*"([A-Z]+)"/)?.[1];
+  const t = line.includes("drivers: [") && line.match(/id:\s*"([a-z]+)"/)?.[1];
+  const newPrice = d ? driverPrices[d] : t ? teamPrices[t] : undefined;
+  if (newPrice === undefined) return line;
+  const old = parseFloat(line.match(/price:\s*([\d.]+)/)?.[1]);
+  if (old !== newPrice) changes.push(`${d || t}: ${old} → ${newPrice}`);
+  return line.replace(/price:\s*[\d.]+/, `price: ${newPrice.toFixed(1)}`);
+}).join("\n");
 
-if (missed.length) console.warn(`Nisu pronađeni u constants.ts (preskočeno): ${missed.join(", ")}`);
+if (!changes.length) { console.log("Nema promjena cijena — ništa za commitati."); process.exit(0); }
 
 const dateStr = new Date().toLocaleDateString("hr-HR", { day:"2-digit", month:"2-digit", year:"numeric" });
-content = content.replace(/\/\/ Zadnje ažuriranje:[^\n]*/, `// Zadnje ažuriranje: ${dateStr} (auto-sync)`);
-
-if (content === before) { console.log("Nema promjena cijena — ništa za commitati."); process.exit(0); }
+content = content.replace(/\/\/ Zadnje ažuriranje:[^\n]*/, `// Zadnje ažuriranje: ${dateStr} (auto-sync, gameday ${latest.n})`);
 
 writeFileSync(CONSTANTS_PATH, content);
-console.log(`✓ Ažurirano ${changed} cijena u ${CONSTANTS_PATH}`);
+console.log(`✓ Promijenjeno ${changes.length} cijena:\n  ${changes.join("\n  ")}`);
