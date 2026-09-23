@@ -192,7 +192,7 @@ const DRIVER_BASELINE: Record<string, number> = {
 // ─── Vozači koji NE VOZE ovaj vikend (supstitucije, ozljede, kazne) ──────────
 // Ažuriraj ručno po potrebi — EV im pada na 0 pa ih optimizer nikad ne bira,
 // a transfer logika ih automatski predlaže za prodaju.
-const UNAVAILABLE_DRIVERS = new Set<string>(["HAD"]);  // R9: Hadjar out, mijenja ga Lawson
+const UNAVAILABLE_DRIVERS = new Set<string>(["TSU"]);  // HAD vraćen u Red Bull, LAW u RB — Tsunoda ne vozi
 const TEAM_FACTOR: Record<string, number> = {
   mercedes:1.0, mclaren:1.0, ferrari:0.98, redbull:0.95, williams:0.92,
   rb:0.88, aston:0.85, haas:0.85, audi:0.82, alpine:0.80, cadillac:0.65,
