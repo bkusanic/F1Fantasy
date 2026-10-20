@@ -363,6 +363,7 @@ interface AppState {
   remainingBudget: number;
   totalBudget: number;
   track: Track;
+  postQuali?: boolean;
 }
 
 function Onboarding({ onFinish }: { onFinish: (s: AppState) => void }) {
@@ -374,6 +375,7 @@ function Onboarding({ onFinish }: { onFinish: (s: AppState) => void }) {
   const [captain, setCaptain] = useState("");
   const [usedChips, setUsedChips] = useState<string[]>([]);
   const [freeTransfers, setFreeTransfers] = useState(2);
+  const [postQuali, setPostQuali] = useState(false);
   const [remainingBudget, setRemainingBudget] = useState(2.0);
   const [totalBudget, setTotalBudget] = useState(100.0);
   const nextTrack = TRACKS_2025.find(t => t.date >= new Date().toISOString().slice(0, 10)) ?? TRACKS_2025[4];
@@ -488,6 +490,7 @@ function Onboarding({ onFinish }: { onFinish: (s: AppState) => void }) {
     remainingBudget: mode === "fresh" ? totalBudget : remainingBudget,
     totalBudget,
     track,
+    postQuali: mode === "existing" && postQuali,
   });
 
   return (
@@ -738,7 +741,7 @@ function Onboarding({ onFinish }: { onFinish: (s: AppState) => void }) {
                 </div>
                 <Label>Slobodni transferi ovaj vikend</Label>
                 <div style={{ display: "flex", gap: 8 }}>
-                  {[1, 2, 3].map(n => (
+                  {[0, 1, 2, 3].map(n => (
                     <button key={n} onClick={() => setFreeTransfers(n)} style={{
                       flex: 1, padding: "12px", cursor: "pointer",
                       background: freeTransfers === n ? S.blue + "22" : S.card2,
@@ -747,6 +750,26 @@ function Onboarding({ onFinish }: { onFinish: (s: AppState) => void }) {
                       borderRadius: 3, fontFamily: "monospace", fontSize: 18, fontWeight: 900,
                     }}>{n}{freeTransfers === n && <div style={{ fontSize: 10, color: S.blue }}>✓</div>}</button>
                   ))}
+                </div>
+
+                <Label>Faza vikenda</Label>
+                <div onClick={() => setPostQuali(v => !v)} style={{
+                  display: "flex", alignItems: "flex-start", gap: 12, cursor: "pointer",
+                  background: postQuali ? "#FF800018" : S.card2,
+                  border: `2px solid ${postQuali ? "#FF8000" : S.border}`,
+                  borderRadius: 3, padding: "12px 14px" }}>
+                  <div style={{ width: 20, height: 20, flexShrink: 0, marginTop: 1, borderRadius: 3,
+                    border: `2px solid ${postQuali ? "#FF8000" : S.muted}`,
+                    background: postQuali ? "#FF8000" : "transparent",
+                    color: "#000", fontSize: 13, fontWeight: 900, textAlign: "center", lineHeight: "16px" }}>
+                    {postQuali ? "✓" : ""}</div>
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: postQuali ? "#FF8000" : S.white }}>
+                      🔧 Kvalifikacije za Grand Prix su završene</div>
+                    <div style={{ fontSize: 11, color: S.silver, lineHeight: 1.6, marginTop: 3 }}>
+                      Tim je zaključan. App procjenjuje samo isplati li se <strong>Final Fix</strong> zamjena
+                      jednog vozača, prema startnoj mreži. Final Fix ne troši slobodni transfer.</div>
+                  </div>
                 </div>
               </div>
             )}
@@ -1168,6 +1191,39 @@ function ResultView({
         {/* Bottom strip: changes + chip */}
         <div style={{ background: S.card, border: `1px solid ${S.border}`, borderRadius: 6,
           overflow: "hidden" }}>
+          {/* Final Fix (nakon GP kvalifikacija) */}
+          {prediction.postQuali && (() => {
+            const ff = prediction.finalFix ?? {};
+            const col = ff.recommendation === "use" ? "#5AB4FF" : ff.recommendation === "consider" ? "#4ADE80" : S.gold;
+            const head = ff.recommendation === "use" ? "✅ KORISTI FINAL FIX"
+              : ff.recommendation === "consider" ? "💡 RAZMOTRI FINAL FIX" : "SAČUVAJ FINAL FIX";
+            return (
+              <div style={{ padding: "14px 20px", borderBottom: `1px solid ${S.border}`, background: col + "12" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 16 }}>🔧</span>
+                  <span style={{ fontSize: 14, fontWeight: 900, color: col }}>{head}</span>
+                  {ff.best && ff.recommendation !== "save" && (
+                    <span style={{ fontFamily: "monospace", fontSize: 13, color: S.white }}>
+                      <span style={{ color: S.err }}>{ff.best.out}</span> (P{ff.best.outGrid || "?"}) →{" "}
+                      <span style={{ color: "#4ADE80" }}>{ff.best.in}</span> (P{ff.best.inGrid})
+                      {"  "}<strong style={{ color: S.gold }}>+{ff.best.gain} pts</strong>
+                      {ff.best.boostSlot && <span style={{ color: "#FF8000" }}> ⚡ boost prelazi na {ff.best.in}</span>}
+                      <span style={{ color: S.muted }}> · budžet poslije ${ff.best.budgetAfter}M</span>
+                    </span>
+                  )}
+                </div>
+                <div style={{ fontSize: 12, color: S.silver, marginTop: 6, lineHeight: 1.6 }}>
+                  {ff.reason} Tim je zaključan — obični transferi i promjena boosta više nisu mogući.
+                </div>
+                {ff.alternatives?.length > 0 && ff.recommendation !== "save" && (
+                  <div style={{ fontSize: 11, color: S.muted, marginTop: 6, fontFamily: "monospace" }}>
+                    Alternative: {ff.alternatives.map((a: any) => `${a.out}→${a.in} +${a.gain}`).join(" · ")}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+
           {/* Sessions warning */}
           {prediction.sessionsWarning && (
             <div style={{ padding: "10px 20px", borderBottom: `1px solid ${S.border}`,
@@ -2071,7 +2127,8 @@ export default function Home() {
             },
             track, allDriverData, constructorData,
             availableChips: CHIPS.filter(c => !usedChips.includes(c.id)).map(c => c.id),
-            activeChip, freeTransfers, remainingBudget };
+            activeChip, freeTransfers, remainingBudget,
+            phase: appState.postQuali ? "post_quali" : "pre_quali" };
 
       const res = await fetch("/api/predict", {
         method: "POST", headers: { "Content-Type": "application/json" },

@@ -284,7 +284,9 @@ interface WeekendData {
   // Separate signals per spec §3 Korak 1
   qualiSimScores:  Record<string, number>;  // 0-1, based on fastest lap (short run)
   longRunScores:   Record<string, number>;  // 0-1, based on consistent long stints
-  gridPositions:   Record<string, number>;  // if qualifying already done
+  gridPositions:   Record<string, number>;  // if qualifying already done (latest quali, may be Sprint Quali)
+  gpGridPositions: Record<string, number>;  // ONLY Grand Prix qualifying (session "Qualifying") — Final Fix input
+  gpQualiDone:     boolean;
   sessionsCompleted: number;                // practice sessions seen
   expectedPractice: number;                 // 1 for sprint weekends, 3 otherwise
   sessionNames:    string[];
@@ -295,7 +297,7 @@ interface WeekendData {
 async function getWeekendData(trackId: string, year: number, isSprint: boolean): Promise<WeekendData> {
   const expectedPractice = isSprint ? 1 : 3;
   const empty: WeekendData = {
-    qualiSimScores:{}, longRunScores:{}, gridPositions:{},
+    qualiSimScores:{}, longRunScores:{}, gridPositions:{}, gpGridPositions:{}, gpQualiDone:false,
     sessionsCompleted:0, expectedPractice, sessionNames:[], noiseLevel:"high", available:false,
   };
   try {
@@ -327,6 +329,9 @@ async function getWeekendData(trackId: string, year: number, isSprint: boolean):
     const latestQuali = qualiCompleted.sort((a,b) =>
       new Date(b.date_start).getTime() - new Date(a.date_start).getTime())[0];
 
+    // Grand Prix qualifying only (exact name — excludes "Sprint Qualifying"/"Sprint Shootout")
+    const gpQuali = qualiCompleted.find(s => s.session_name === "Qualifying");
+
     let gridPositions: Record<string,number> = {};
     if (latestQuali) {
       const [posRes, drRes] = await Promise.all([
@@ -344,6 +349,26 @@ async function getWeekendData(trackId: string, year: number, isSprint: boolean):
           const code = num2code[parseInt(num)];
           if (code) gridPositions[code] = pos;
         }
+      }
+    }
+    // GP grid: reuse if latest quali IS the GP quali, otherwise fetch separately
+    let gpGridPositions: Record<string,number> = {};
+    if (gpQuali) {
+      if (latestQuali && gpQuali.session_key === latestQuali.session_key) {
+        gpGridPositions = { ...gridPositions };
+      } else {
+        try {
+          const [pR, dR] = await Promise.all([
+            fetchT(`https://api.openf1.org/v1/position?session_key=${gpQuali.session_key}`, { next:{revalidate:300} }, 5000),
+            fetchT(`https://api.openf1.org/v1/drivers?session_key=${gpQuali.session_key}`, { next:{revalidate:300} }, 5000),
+          ]);
+          if (pR.ok && dR.ok) {
+            const ps: any[] = await pR.json(); const ds: any[] = await dR.json();
+            const n2c: Record<number,string> = {};
+            for (const d of ds) if (d.name_acronym) n2c[d.driver_number] = d.name_acronym;
+            for (const x of ps) if (x.position && n2c[x.driver_number]) gpGridPositions[n2c[x.driver_number]] = x.position;
+          }
+        } catch {}
       }
     }
 
@@ -401,6 +426,7 @@ async function getWeekendData(trackId: string, year: number, isSprint: boolean):
 
     return {
       qualiSimScores, longRunScores, gridPositions,
+      gpGridPositions, gpQualiDone: Object.keys(gpGridPositions).length >= 15,
       sessionsCompleted, expectedPractice,
       sessionNames: completed.map(s => s.session_name),
       noiseLevel,
@@ -951,8 +977,102 @@ const CHIP_ICONS: Record<string,string> = {
 };
 interface ChipScore{chip:string;icon:string;score:number;label:"PREPORUČENO"|"DOBRO"|"SAČUVAJ";reason:string}
 
+// ─── FINAL FIX (nakon kvalifikacija za Grand Prix) ───────────────────────────
+// Pravila (F1 Fantasy): jedna zamjena VOZAČA između GP kvalifikacija i utrke;
+// ne troši free transfer; izbačeni vozač ZADRŽAVA već osvojene bodove (quali + sprint);
+// boost se ne smije prebaciti na drugog vozača koji je već u timu.
+// Pretpostavka: ako izbaciš boost vozača, novi vozač preuzima 2× (boost prati slot).
+// Zato se uspoređuju SAMO bodovi preostale utrke (GP), a ne cijeli vikend.
+
+const GP_PTS_FF: Record<number, number> = {1:25,2:18,3:15,4:12,5:10,6:8,7:6,8:4,9:2,10:1};
+const FF_MIN_GAIN_RECOMMEND = 10;  // pts — ispod toga chip nije vrijedan trošenja
+const FF_MIN_GAIN_CONSIDER  = 5;
+
+interface FinalFixSwap {
+  out: string; in: string; outGrid: number; inGrid: number;
+  outRaceEV: number; inRaceEV: number; boostSlot: boolean;
+  gain: number; budgetAfter: number;
+}
+interface FinalFixResult {
+  available: boolean; reason: string;
+  best: FinalFixSwap | null; alternatives: FinalFixSwap[];
+  recommendation: "use" | "consider" | "save";
+  raceEV: Record<string, number>;
+}
+
+/** Očekivani bodovi SAMO iz Grand Prixa, uz poznatu startnu poziciju. */
+function raceOnlyEV(grid: number, paceRank: number, overtaking: number, dnfRate: number): number {
+  // Koliko se brzi bolid može probiti / spori pasti prema "pravom" tempu ovisi o stazi
+  const pull = 0.25 + 0.55 * Math.max(0, Math.min(1, overtaking));
+  const finish = Math.max(1, Math.min(22, grid + (paceRank - grid) * pull));
+  const f = Math.round(finish);
+  const positionPts = GP_PTS_FF[f] ?? 0;
+  const gained = grid - finish;                         // +1/−1 po poziciji
+  const overtakeBonus = Math.max(0, gained) * 0.5;      // dio pretjecanja koji se boduje dodatno
+  const dnfPenalty = Math.min(0.6, dnfRate) * 20;       // −20 za DNF × vjerojatnost
+  return parseFloat((positionPts + gained + overtakeBonus - dnfPenalty).toFixed(1));
+}
+
+function finalFixAnalysis(
+  teamDrivers: string[], boost: string,
+  grid: Record<string, number>,
+  evMap: Record<string, { ev: number }>,
+  allDriverData: Record<string, any>,
+  remainingBudget: number,
+  overtaking: number,
+  dnfRates: Record<string, number>,
+): FinalFixResult {
+  const empty = (reason: string): FinalFixResult =>
+    ({ available: false, reason, best: null, alternatives: [], recommendation: "save", raceEV: {} });
+  if (Object.keys(grid).length < 15)
+    return empty("Startna mreža za Grand Prix još nije dostupna (OpenF1) — pokreni ponovno nakon kvalifikacija.");
+
+  // Tempo rang iz cjelovikendnog EV-a (forma + staza + kvote + treninzi)
+  const active = Object.keys(allDriverData).filter(c => !UNAVAILABLE_DRIVERS.has(c) && grid[c]);
+  const paceOrder = [...active].sort((a, b) => (evMap[b]?.ev ?? 0) - (evMap[a]?.ev ?? 0));
+  const paceRank: Record<string, number> = {};
+  paceOrder.forEach((c, i) => (paceRank[c] = i + 1));
+
+  const raceEV: Record<string, number> = {};
+  for (const c of Object.keys(allDriverData)) {
+    raceEV[c] = UNAVAILABLE_DRIVERS.has(c) || !grid[c] ? 0
+      : raceOnlyEV(grid[c], paceRank[c] ?? 20, overtaking, dnfRates[c] ?? 0.08);
+  }
+
+  const swaps: FinalFixSwap[] = [];
+  for (const out of teamDrivers) {
+    const outPrice = allDriverData[out]?.price ?? 0;
+    const mult = out === boost ? 2 : 1;
+    for (const inn of active) {
+      if (teamDrivers.includes(inn)) continue;
+      const inPrice = allDriverData[inn]?.price ?? 99;
+      const budgetAfter = remainingBudget + outPrice - inPrice;
+      if (budgetAfter < -0.001) continue;
+      const gain = (raceEV[inn] - raceEV[out]) * mult;
+      swaps.push({ out, in: inn, outGrid: grid[out] ?? 0, inGrid: grid[inn],
+        outRaceEV: raceEV[out], inRaceEV: raceEV[inn], boostSlot: mult === 2,
+        gain: parseFloat(gain.toFixed(1)), budgetAfter: parseFloat(budgetAfter.toFixed(1)) });
+    }
+  }
+  swaps.sort((a, b) => b.gain - a.gain || a.budgetAfter - b.budgetAfter);
+  const best = swaps[0] && swaps[0].gain > 0 ? swaps[0] : null;
+  const recommendation = !best ? "save"
+    : best.gain >= FF_MIN_GAIN_RECOMMEND ? "use"
+    : best.gain >= FF_MIN_GAIN_CONSIDER ? "consider" : "save";
+  // Alternative: najbolja zamjena za svaki drugi izlazni slot (raznolikost)
+  const seen = new Set(best ? [best.out] : []);
+  const alternatives = swaps.filter(s => s.gain > 0 && !seen.has(s.out) && (seen.add(s.out), true)).slice(0, 3);
+
+  const reason = !best
+    ? "Nijedna zamjena unutar budžeta ne donosi više bodova u utrci — sačuvaj Final Fix."
+    : `${best.out} (start P${best.outGrid || "?"}) → ${best.in} (start P${best.inGrid}): ` +
+      `+${best.gain} pts u utrci${best.boostSlot ? " (boost slot, 2×)" : ""}.`;
+  return { available: true, reason, best, alternatives, recommendation, raceEV };
+}
+
 function scoreChips(chips:string[],track:{isSprint:boolean;circuitType:string;round:number;id?:string},
-  totalRounds:number,avgDnfRate:number,pred:number,isNewTrack:boolean=false):ChipScore[]{
+  totalRounds:number,avgDnfRate:number,pred:number,isNewTrack:boolean=false,
+  ff:FinalFixResult|null=null,postQuali:boolean=false):ChipScore[]{
   // New track (no Jolpica history): risk is UNKNOWN, not low.
   // Default avgDnfRate (0.08) would understate it — assume elevated risk instead.
   const effDnf = isNewTrack ? Math.max(avgDnfRate, 0.18) : avgDnfRate;
@@ -974,9 +1094,21 @@ function scoreChips(chips:string[],track:{isSprint:boolean;circuitType:string;ro
       case"autopilot":score=track.isSprint?72:Math.round(20+(1-pred)*35);
         reason=track.isSprint?"Sprint — AutoPilot auto bira DRS.":"Extra DRS je jači chip.";break;
       case"wildcard":score=35;reason="Korisno samo ako tim loše performira 3+ utrke.";break;
-      case"final_fix":score=Math.round((track.round/totalRounds)*55+(track.isSprint?18:0));
-        reason=track.round>=totalRounds*0.75?"Kasna sezona — Final Fix najvrijedniji."
-          :`Sačuvaj za R${Math.round(totalRounds*0.75)}+.`;break;
+      case"final_fix":
+        if (postQuali && ff?.available) {
+          // Nakon GP kvalifikacija: ocjena = stvarni dobitak najbolje zamjene
+          score = ff.recommendation==="use" ? 95 : ff.recommendation==="consider" ? 55 : 20;
+          reason = ff.recommendation==="save" ? ff.reason
+            : `${ff.reason} Ne troši free transfer.`;
+        } else if (postQuali) {
+          score=30; reason=ff?.reason ?? "Startna mreža nije dostupna — Final Fix se ne može procijeniti.";
+        } else {
+          // Prije kvalifikacija se NE aktivira — odluka ovisi o startnoj mreži
+          score=Math.min(40, Math.round((track.round/totalRounds)*30+(track.isSprint?8:0)));
+          reason="Odluka tek nakon kvalifikacija za Grand Prix — tad pokreni app s opcijom "+
+            "\"Kvalifikacije završene\" i vidjet ćeš isplati li se zamjena.";
+        }
+        break;
     }
     return{chip,icon:CHIP_ICONS[chip]??"🎯",score,
       label:(score>=68?"PREPORUČENO":score>=42?"DOBRO":"SAČUVAJ")as ChipScore["label"],reason};
@@ -997,7 +1129,8 @@ export async function POST(req: NextRequest) {
     tick("START parse body");
     const body = await req.json();
     const {mode="existing",team,track,allDriverData={},constructorData={},
-      availableChips=[],freeTransfers=2,remainingBudget=2,totalBudget=100} = body;
+      availableChips=[],freeTransfers=2,remainingBudget=2,totalBudget=100,
+      phase="pre_quali", manualGrid=null} = body;
 
     const isFresh = mode==="fresh";
     const circuitId = CIRCUIT_IDS[track.id]??track.id;
@@ -1007,7 +1140,7 @@ export async function POST(req: NextRequest) {
     const emptyForm: Record<string, DForm> = {};
     const emptyTrack = { stats: {} as Record<string,THistory>, avgDnfRate: 0.08 };
     const weekendFallback: WeekendData = {
-      qualiSimScores:{}, longRunScores:{}, gridPositions:{},
+      qualiSimScores:{}, longRunScores:{}, gridPositions:{}, gpGridPositions:{}, gpQualiDone:false,
       sessionsCompleted:0, expectedPractice: track.isSprint ? 1 : 3,
       sessionNames:[], noiseLevel:"high", available:false,
     };
@@ -1054,7 +1187,22 @@ export async function POST(req: NextRequest) {
     // 3. Optimize
     const pred = Math.max(0,Math.min(1,1-avgDnfRate*2.5-(track.circuitType==="street"?0.2:0)));
     const isNewTrack = Object.keys(trackStats).length === 0;
-    const chipScores = scoreChips(availableChips, track, 22, avgDnfRate, pred, isNewTrack);
+
+    // Final Fix: faza nakon GP kvalifikacija (korisnik označio ILI OpenF1 ima GP grid)
+    const gpGrid: Record<string,number> =
+      manualGrid && Object.keys(manualGrid).length >= 15 ? manualGrid : weekend.gpGridPositions;
+    const postQuali = !isFresh && (phase === "post_quali" || weekend.gpQualiDone);
+    const ffAvailable = availableChips.includes("final_fix");
+    let ffResult: FinalFixResult | null = null;
+    if (postQuali && ffAvailable) {
+      const dnfRates = Object.fromEntries(Object.keys(allDriverData).map(c=>[c, driverForm[c]?.dnfRate ?? 0.08]));
+      ffResult = finalFixAnalysis(team?.drivers??[], team?.captain??"", gpGrid, evMap, allDriverData,
+        remainingBudget, TRACK_OVERTAKING[track.id] ?? 0.45, dnfRates);
+      tick(`final fix: ${ffResult.recommendation} ${ffResult.best ? ffResult.best.out+"→"+ffResult.best.in+" +"+ffResult.best.gain : "-"}`);
+    }
+    // Nakon zaključavanja tima drugi chipovi se više ne mogu aktivirati — ostaje samo Final Fix
+    const chipScores = scoreChips(availableChips, track, 22, avgDnfRate, pred, isNewTrack, ffResult, postQuali)
+      .filter(c => !postQuali || c.chip === "final_fix");
     let optResult: any = {};
     let noTransferScore = 0;
 
@@ -1216,6 +1364,28 @@ export async function POST(req: NextRequest) {
         :`${fc} besplatn${fc===1?"i":"a"} transfer${pc>0?` + ${pc} plaćen${pc===1?"i":"a"} (−${pc*10} pts)`:""} · neto: +${resp.totalNetGain} pts`;
       resp.predictedPoints   = Object.fromEntries((team?.drivers??[]).map((c:string)=>[c,expPts[c]??0]));
       resp.constructorPoints = Object.fromEntries((team?.constructors??[]).map((c:string)=>[c,expPts[c]??0]));
+
+      // ── Nakon GP kvalifikacija tim je zaključan: jedini mogući potez je Final Fix ──
+      if (postQuali) {
+        resp.postQuali = true;
+        resp.transfers = []; resp.weakLinks = []; resp.boostChanged = false;
+        resp.totalNetGain = 0; resp.totalTransferCost = 0;
+        resp.drsBoostRecommendation = { driverId: team?.captain ?? "",
+          reason: "Tim je zaključan nakon kvalifikacija — boost se ne može mijenjati (osim ako Final Fix izbaci boost vozača)." };
+        resp.sessionsWarning = null;
+        const fb = ffResult?.best && ffResult.recommendation !== "save" ? ffResult.best : null;
+        resp.finalFix = ffResult ?? { available:false, recommendation:"save", best:null, alternatives:[],
+          reason: ffAvailable ? "Startna mreža nije dostupna." : "Final Fix je već iskorišten ove sezone." };
+        resp.recommendedTeam = {
+          drivers: (team?.drivers??[]).map((d:string)=> fb && d===fb.out ? fb.in : d),
+          constructors: [...(team?.constructors??[])],
+          changedDrivers: fb ? [fb.in] : [], changedConstructors: [], unchanged: !fb,
+        };
+        resp.transferSummary = !ffAvailable
+          ? "Tim je zaključan nakon kvalifikacija, a Final Fix je iskorišten — nema mogućih izmjena."
+          : fb ? `🔧 Final Fix: ${fb.out} → ${fb.in} (+${fb.gain} pts u utrci, ne troši transfer)`
+          : "Tim je zaključan nakon kvalifikacija. Final Fix zamjena se ne isplati — sačuvaj ga.";
+      }
     }
 
     tick("DONE");

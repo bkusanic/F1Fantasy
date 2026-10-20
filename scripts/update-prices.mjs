@@ -49,7 +49,11 @@ for (const p of latest.list) {
   const tla = String(p?.DriverTLA ?? "").toUpperCase();
   const price = parseFloat(p?.Value);
   if (!tla || isNaN(price)) continue;
-  if (p?.PositionName === "DRIVER") driverPrices[tla] = price;
+  if (p?.PositionName === "DRIVER") {
+    // Vozač koji je mijenjao tim pojavljuje se dvaput (aktivni + neaktivni unos) — uzmi aktivni
+    const active = String(p?.IsActive ?? "1") === "1";
+    if (active || !(tla in driverPrices)) driverPrices[tla] = price;
+  }
   else if (p?.PositionName === "CONSTRUCTOR") {
     const id = CONSTR_TLA[tla];
     if (id) teamPrices[id] = price; else unknown.push(`konstruktor ${tla} (${p?.FUllName})`);
