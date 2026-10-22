@@ -2,7 +2,7 @@ import type { Driver, Constructor, Track } from "./types";
 
 // ─── 2026 Driver Roster ───────────────────────────────────────────────────────
 // ⚠️  CIJENE SE MIJENJAJU SVAKI TJEDAN — ažuriraj iz F1 Fantasy app prije svake utrke!
-// Zadnje ažuriranje: 15. 10. 2026. (auto-sync, gameday 18)
+// Zadnje ažuriranje: 22. 10. 2026. (auto-sync, gameday 18)
 
 export const DRIVERS_2025: Driver[] = [
   // McLaren
@@ -21,7 +21,7 @@ export const DRIVERS_2025: Driver[] = [
   { id: "alb", name: "Alex Albon",        shortName: "ALB", team: "williams",  price: 4.6, driverNumber: 23 },
   { id: "sai", name: "Carlos Sainz",      shortName: "SAI", team: "williams",  price: 8.4, driverNumber: 55 },
   // Racing Bulls
-  { id: "law", name: "Liam Lawson",       shortName: "LAW", team: "rb",        price: 15.1,  driverNumber: 30 }, // vratio se u Racing Bulls
+  { id: "law", name: "Liam Lawson",       shortName: "LAW", team: "rb",        price: 9.9,  driverNumber: 30 }, // vratio se u Racing Bulls
   { id: "lin", name: "Arvid Lindblad",    shortName: "LIN", team: "rb",        price: 10.0,  driverNumber: 41 },
   { id: "tsu", name: "Yuki Tsunoda",      shortName: "TSU", team: "rb",        price: 9.7,  driverNumber: 22 }, // NE VOZI (UNAVAILABLE_DRIVERS) — ostaje u listi jer ga postojeći timovi mogu imati
   // Aston Martin
