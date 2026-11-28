@@ -2,7 +2,7 @@ import type { Driver, Constructor, Track } from "./types";
 
 // ─── 2026 Driver Roster ───────────────────────────────────────────────────────
 // ⚠️  CIJENE SE MIJENJAJU SVAKI TJEDAN — ažuriraj iz F1 Fantasy app prije svake utrke!
-// Zadnje ažuriranje: 26. 11. 2026. (auto-sync, gameday 22)
+// Zadnje ažuriranje: 28. 11. 2026. (admin)
 
 export const DRIVERS_2025: Driver[] = [
   // McLaren
@@ -29,7 +29,7 @@ export const DRIVERS_2025: Driver[] = [
   { id: "str", name: "Lance Stroll",      shortName: "STR", team: "aston",     price: 3.0,  driverNumber: 18 }, // ↓ was 7.5
   // Haas
   { id: "oco", name: "Esteban Ocon",      shortName: "OCO", team: "haas",      price: 10.1, driverNumber: 31 }, // NE VOZI od Brazila (UNAVAILABLE_DRIVERS) — Haas ga je zamijenio Câmarom
-  { id: "cam", name: "Rafael Câmara",     shortName: "CAM", team: "haas",      price: 5.0,  driverNumber: 51 }, // od Brazila mijenja Ocona — cijenu potvrdi u /admin
+  { id: "cam", name: "Rafael Câmara",     shortName: "CAM", team: "haas",      price: 4.8,  driverNumber: 51 }, // od Brazila mijenja Ocona — cijenu potvrdi u /admin
   { id: "bea", name: "Oliver Bearman",    shortName: "BEA", team: "haas",      price: 4.4,  driverNumber: 87 },
   // Audi (ex-Sauber)
   { id: "hul", name: "Nico Hülkenberg",   shortName: "HUL", team: "audi",      price: 7.0,  driverNumber: 27 },
