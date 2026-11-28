@@ -45,8 +45,21 @@ console.log(`Najnoviji feed: gameday ${latest.n} (FeedTime UTC: ${latest.feedTim
 
 // ── 2. Parsiranje ────────────────────────────────────────────────────────────
 const driverPrices = {}, teamPrices = {}, unknown = [];
+// Rezervno mapiranje po prezimenu (za nove vozače čiji se TLA u feedu razlikuje od našeg koda)
+const norm = x => String(x ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+const lastToCode = {};
+for (const l of readFileSync(CONSTANTS_PATH, "utf-8").split("\n")) {
+  const sn = l.includes("driverNumber") && l.match(/shortName:\s*"([A-Z]+)"/)?.[1];
+  const nm = sn && l.match(/name:\s*"([^"]+)"/)?.[1];
+  if (nm) lastToCode[norm(nm.split(" ").pop())] = sn;
+}
 for (const p of latest.list) {
-  const tla = String(p?.DriverTLA ?? "").toUpperCase();
+  let tla = String(p?.DriverTLA ?? "").toUpperCase();
+  if (p?.PositionName === "DRIVER") {
+    const byName = lastToCode[norm(String(p?.FUllName ?? "").trim().split(/\s+/).pop())];
+    const known = Object.values(lastToCode).includes(tla);
+    if (!known && byName) { console.log(`  ${tla} (${p?.FUllName}) → mapiran po prezimenu na ${byName}`); tla = byName; }
+  }
   const price = parseFloat(p?.Value);
   if (!tla || isNaN(price)) continue;
   if (p?.PositionName === "DRIVER") {

@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { TRACKS_2025 } from "@/lib/constants";
 
 // Vercel: allow up to 60s (Pro) / 15s (Hobby).
 // Without this, Hobby plan cuts off at 10s which isn't enough.
@@ -78,7 +79,7 @@ const ODDS_LASTNAME_TO_CODE: Record<string, string> = {
   alonso:"ALO", stroll:"STR", ocon:"OCO", bearman:"BEA",
   hulkenberg:"HUL", "hülkenberg":"HUL", bortoleto:"BOR",
   gasly:"GAS", colapinto:"COL", perez:"PER", "pérez":"PER", bottas:"BOT",
-  tsunoda:"TSU",
+  tsunoda:"TSU", camara:"CAM", "câmara":"CAM",
 };
 
 interface OddsData {
@@ -186,13 +187,13 @@ async function getOdds(): Promise<OddsData> {
 const DRIVER_BASELINE: Record<string, number> = {
   ANT:32, RUS:28, NOR:26, PIA:23, LEC:22, VER:20, HAM:19, SAI:15,
   ALB:13, HAD:12, LAW:11, TSU:10, BEA:11, ALO:9, OCO:9, GAS:8, HUL:8,
-  BOR:7, STR:7, COL:6, LIN:6, PER:4, BOT:4,
+  BOR:7, CAM:6, STR:7, COL:6, LIN:6, PER:4, BOT:4,
 };
 
 // ─── Vozači koji NE VOZE ovaj vikend (supstitucije, ozljede, kazne) ──────────
 // Ažuriraj ručno po potrebi — EV im pada na 0 pa ih optimizer nikad ne bira,
 // a transfer logika ih automatski predlaže za prodaju.
-const UNAVAILABLE_DRIVERS = new Set<string>(["TSU"]);  // HAD vraćen u Red Bull, LAW u RB — Tsunoda ne vozi
+const UNAVAILABLE_DRIVERS = new Set<string>(["TSU", "OCO"]);  // TSU ne vozi; OCO izbačen iz Haasa od Brazila (mijenja ga Câmara)
 const TEAM_FACTOR: Record<string, number> = {
   mercedes:1.0, mclaren:1.0, ferrari:0.98, redbull:0.95, williams:0.92,
   rb:0.88, aston:0.85, haas:0.85, audi:0.82, alpine:0.80, cadillac:0.65,
@@ -1070,6 +1071,70 @@ function finalFixAnalysis(
   return { available: true, reason, best, alternatives, recommendation, raceEV };
 }
 
+// ─── Kraj sezone: plan potrošnje chipova ─────────────────────────────────────
+// Pravilo igre: najviše JEDAN chip po vikendu. Kad je chipova ≥ preostalih utrka,
+// čuvanje nema smisla — chip koji se ne potroši propada. Raspoređujemo chipove na
+// preostale utrke tako da zbroj ocjena bude maksimalan (iscrpno, mali prostor).
+interface EndgamePlan { active: boolean; racesLeft: number; plan: Record<string,string>; wasted: string[] }
+
+function planEndgameChips(
+  base: ChipScore[], current: { id: string; name: string },
+  laterTracks: { id: string; name: string; date: string }[],
+  scoreAt: (trackId: string) => ChipScore[], postQuali: boolean,
+): { scores: ChipScore[]; plan: EndgamePlan } {
+  const races = [current, ...laterTracks];
+  const chips = base.map(c => c.chip);
+  const plan: EndgamePlan = { active: false, racesLeft: races.length, plan: {}, wasted: [] };
+  if (!chips.length || chips.length < races.length) return { scores: base, plan };
+  plan.active = true;
+
+  // Ocjena chipa po utrci; Final Fix prije kvalifikacija vrijedi umjereno (besplatna zamjena)
+  const val = (chip: string, ri: number): number => {
+    const list = ri === 0 ? base : scoreAt(races[ri].id);
+    let v = list.find(c => c.chip === chip)?.score ?? 0;
+    if (chip === "final_fix" && !(ri === 0 && postQuali)) v = Math.max(v, 60);
+    return v;
+  };
+  let best = -1, bestAssign: (string|null)[] = [];
+  const rec = (ri: number, used: Set<string>, acc: (string|null)[], sum: number) => {
+    if (ri === races.length) { if (sum > best) { best = sum; bestAssign = [...acc]; } return; }
+    for (const c of chips) if (!used.has(c)) {
+      used.add(c); acc.push(c); rec(ri+1, used, acc, sum + val(c, ri)); acc.pop(); used.delete(c);
+    }
+  };
+  rec(0, new Set(), [], 0);
+
+  bestAssign.forEach((c, ri) => { if (c) plan.plan[c] = races[ri].name; });
+  plan.wasted = chips.filter(c => !(c in plan.plan));
+  const nChips = (n: number) => `${n} ${n===1?"chip":n<5?"chipa":"chipova"}`;
+  const WHAT: Record<string,string> = {
+    limitless: "Limitless: neograničen budžet i transferi samo za ovu utrku — složi najjači mogući tim.",
+    wildcard: "Wildcard: neograničeni besplatni transferi, tim ostaje i za sljedeću utrku.",
+    no_negative: "No Negative: negativni bodovi vozača/konstruktora računaju se kao 0.",
+    extra_drs: "Extra DRS: 3× bodovi za odabranog vozača.",
+    autopilot: "Autopilot: 2× boost automatski ide vozaču s najviše bodova.",
+    final_fix: "Final Fix: jedna besplatna zamjena vozača nakon kvalifikacija.",
+  };
+  const planTxt = races.map((r, ri) => `${r.name}: ${bestAssign[ri]?.replace("_"," ") ?? "—"}`).join(" · ");
+  const nowChip = bestAssign[0];
+
+  const scores = base.map(cs => {
+    if (cs.chip === nowChip) {
+      const extra = cs.chip === "final_fix" && !postQuali
+        ? " Aktivira se NAKON kvalifikacija — tad pokreni app s opcijom \"Kvalifikacije završene\"." : "";
+      return { ...cs, score: Math.max(cs.score, 92), label: "PREPORUČENO" as const,
+        reason: `Kraj sezone: ${races.length} ${races.length===1?"utrka":"utrke"}, ${nChips(chips.length)} — `+
+          `neiskorišteni chip propada. Plan: ${planTxt}. ${WHAT[cs.chip] ?? ""}${extra}` };
+    }
+    if (cs.chip in plan.plan)
+      return { ...cs, score: Math.min(cs.score, 60), label: "SAČUVAJ" as const,
+        reason: `Planiran za ${plan.plan[cs.chip]} (jedan chip po vikendu). ${WHAT[cs.chip] ?? ""}` };
+    return { ...cs, score: Math.min(cs.score, 15), label: "SAČUVAJ" as const,
+      reason: `Ne stane u plan — više chipova nego utrka (jedan chip po vikendu), ovaj će ostati neiskorišten.` };
+  }).sort((a, b) => b.score - a.score);
+  return { scores, plan };
+}
+
 function scoreChips(chips:string[],track:{isSprint:boolean;circuitType:string;round:number;id?:string},
   totalRounds:number,avgDnfRate:number,pred:number,isNewTrack:boolean=false,
   ff:FinalFixResult|null=null,postQuali:boolean=false):ChipScore[]{
@@ -1201,8 +1266,28 @@ export async function POST(req: NextRequest) {
       tick(`final fix: ${ffResult.recommendation} ${ffResult.best ? ffResult.best.out+"→"+ffResult.best.in+" +"+ffResult.best.gain : "-"}`);
     }
     // Nakon zaključavanja tima drugi chipovi se više ne mogu aktivirati — ostaje samo Final Fix
-    const chipScores = scoreChips(availableChips, track, 22, avgDnfRate, pred, isNewTrack, ffResult, postQuali)
-      .filter(c => !postQuali || c.chip === "final_fix");
+    // Preostale utrke (uključujući ovu) — za plan potrošnje chipova na kraju sezone
+    const curDate = (TRACKS_2025.find(t => t.id === track.id)?.date) ?? track.date ?? "";
+    const laterTracks = TRACKS_2025.filter(t => t.id !== track.id && t.date > curDate)
+      .sort((a, b) => a.date.localeCompare(b.date));
+    const isEndgame = availableChips.length > 0 && availableChips.length >= laterTracks.length + 1;
+
+    // Kraj sezone + nakon kvalifikacija: ostali chipovi se ovaj vikend više ne mogu aktivirati,
+    // pa je Final Fix s bilo kakvim pozitivnim dobitkom bolji od chipa koji će propasti.
+    if (ffResult?.best && ffResult.best.gain > 0 && isEndgame && ffResult.recommendation !== "use") {
+      ffResult.recommendation = "use";
+      ffResult.reason += laterTracks.length === 0
+        ? " Zadnja utrka — chip bi inače propao."
+        : " Kraj sezone — više chipova nego utrka, pa se čuvanje ne isplati.";
+    }
+
+    const baseChips = scoreChips(availableChips, track, 22, avgDnfRate, pred, isNewTrack, ffResult, postQuali);
+    const { scores: plannedChips, plan: chipPlan } = planEndgameChips(
+      baseChips, track, laterTracks,
+      (tid) => { const t = TRACKS_2025.find(x => x.id === tid)!; return scoreChips(availableChips, t, 22, avgDnfRate, pred, false, null, false); },
+      postQuali);
+    if (chipPlan.active) tick(`endgame chip plan: ${JSON.stringify(chipPlan.plan)} wasted=${chipPlan.wasted}`);
+    const chipScores = plannedChips.filter(c => !postQuali || c.chip === "final_fix");
     let optResult: any = {};
     let noTransferScore = 0;
 
